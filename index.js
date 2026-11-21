@@ -10,7 +10,7 @@ const PORT = process.env.PORT || 8000;
 const CLIENT_URL = process.env.CLIENT_URL || "http://localhost:3000";
 const ALLOW_DEV_AUTH_FALLBACK =
     process.env.NODE_ENV !== "production" &&
-    process.env.ALLOW_DEV_AUTH_FALLBACK !== "false";
+    process.env.ALLOW_DEV_AUTH_FALLBACK === "true";
 
 // Initialize Stripe (if STRIPE_SECRET_KEY is provided)
 const stripe = process.env.STRIPE_SECRET_KEY
@@ -85,26 +85,28 @@ app.post(
         const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
         let event;
 
-        if (stripe && webhookSecret && sig) {
-            try {
-                event = stripe.webhooks.constructEvent(
-                    req.body,
-                    sig,
-                    webhookSecret,
-                );
-            } catch (err) {
-                console.error(
-                    "Webhook signature verification failed:",
-                    err.message,
-                );
-                return res.status(400).send(`Webhook Error: ${err.message}`);
-            }
-        } else {
-            try {
-                event = JSON.parse(req.body.toString());
-            } catch (err) {
-                return res.status(400).send("Invalid JSON payload");
-            }
+        if (!stripe || !webhookSecret) {
+            return res.status(503).json({
+                error: "Stripe webhook is not configured.",
+            });
+        }
+        if (!sig) {
+            return res.status(400).json({
+                error: "Missing Stripe signature.",
+            });
+        }
+        try {
+            event = stripe.webhooks.constructEvent(
+                req.body,
+                sig,
+                webhookSecret,
+            );
+        } catch (err) {
+            console.error(
+                "Webhook signature verification failed:",
+                err.message,
+            );
+            return res.status(400).send(`Webhook Error: ${err.message}`);
         }
 
         if (event.type === "checkout.session.completed") {
@@ -128,7 +130,12 @@ app.post(
                     },
                 });
 
-                if (transactionsCollection) {
+                if (
+                    transactionsCollection &&
+                    !(await transactionsCollection.findOne({
+                        stripeSessionId: session.id,
+                    }))
+                ) {
                     await transactionsCollection.insertOne({
                         appointmentId,
                         customerId: session.metadata?.userEmail || "customer",
@@ -755,6 +762,14 @@ app.post("/create-checkout-session", verifyToken, async (req, res) => {
         if (!apt) {
             return res.status(404).json({ error: "Appointment not found." });
         }
+        if (
+            req.user?.role !== "admin" &&
+            apt.userEmail?.toLowerCase() !== req.user?.email?.toLowerCase()
+        ) {
+            return res.status(403).json({
+                error: "You can only pay for your own appointments.",
+            });
+        }
 
         // Rules: Customers cannot pay for cancelled or pending appointments
         if (apt.status !== "confirmed") {
@@ -770,11 +785,8 @@ app.post("/create-checkout-session", verifyToken, async (req, res) => {
         }
 
         if (!stripe) {
-            // Fallback: Redirect to internal card checkout if Stripe key not provided yet
-            return res.json({
-                url: `${CLIENT_URL}/checkout/${appointmentId}`,
-                message:
-                    "Stripe key not configured — fallback to checkout simulation.",
+            return res.status(503).json({
+                error: "Stripe is not configured. Online checkout is unavailable.",
             });
         }
 
@@ -822,8 +834,15 @@ app.post("/create-checkout-session", verifyToken, async (req, res) => {
 // PATCH /appointment/:id/pay (Fallback simulation for development)
 app.patch("/appointment/:id/pay", verifyToken, async (req, res) => {
     try {
+        if (
+            process.env.NODE_ENV !== "development" ||
+            process.env.ALLOW_DEV_AUTH_FALLBACK !== "true"
+        ) {
+            return res.status(404).json({ error: "Not found." });
+        }
+
         const { id } = req.params;
-        const { paymentMethod, amount } = req.body;
+        const { paymentMethod } = req.body;
 
         const filter = ObjectId.isValid(id)
             ? { _id: new ObjectId(id) }
@@ -835,6 +854,25 @@ app.patch("/appointment/:id/pay", verifyToken, async (req, res) => {
                 return res
                     .status(404)
                     .json({ error: "Appointment not found." });
+
+            if (
+                req.user?.role !== "admin" &&
+                apt.userEmail?.toLowerCase() !== req.user?.email?.toLowerCase()
+            ) {
+                return res.status(403).json({
+                    error: "You can only pay for your own appointments.",
+                });
+            }
+            if (apt.status !== "confirmed") {
+                return res.status(400).json({
+                    error: "Only confirmed appointments can be paid.",
+                });
+            }
+            if (apt.paymentStatus === "paid") {
+                return res.status(409).json({
+                    error: "This appointment has already been paid.",
+                });
+            }
 
             const txnId = `txn-${Date.now()}`;
             await appointmentsCollection.updateOne(filter, {
@@ -853,7 +891,7 @@ app.patch("/appointment/:id/pay", verifyToken, async (req, res) => {
                     customerName: apt.userName,
                     customerEmail: apt.userEmail,
                     serviceName: apt.serviceName,
-                    amount: Number(amount || apt.servicePrice),
+                    amount: Number(apt.servicePrice),
                     currency: "USD",
                     status: "succeeded",
                     paymentMethod: paymentMethod || "Credit Card (Visa 4242)",
@@ -868,7 +906,7 @@ app.patch("/appointment/:id/pay", verifyToken, async (req, res) => {
             });
         }
 
-        res.json({ message: "Payment processed successfully!" });
+        return res.status(503).json({ error: "Database not connected." });
     } catch (err) {
         res.status(500).json({
             error: "Failed to process payment",

@@ -25,7 +25,8 @@ High-performance REST API backend for the **Salonique Salon Appointment Booking 
   - `verifyAdmin` middleware: Enforces master administrator role on all protected service modifications, appointments oversight, and user management routes.
 - **Stripe Checkout & Webhook Integration**:
   - Creates secure Stripe Checkout sessions for confirmed appointments.
-  - Verified `express.raw` Webhook listener (`POST /webhook`) that confirms payment signature before marking appointments as Paid.
+  - `POST /webhook` requires a valid Stripe signature and is disabled until Stripe credentials are configured.
+  - The simulated payment endpoint is available only in development with `ALLOW_DEV_AUTH_FALLBACK=true`; it checks appointment ownership and confirmation status.
 - **User Access Management**:
   - `GET /users`: Retrieves customer directory.
   - `PATCH /user/:email/toggle-block`: Allows admins to block/unblock users. Blocked users are barred from protected booking features.
