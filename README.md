@@ -6,9 +6,9 @@ High-performance REST API backend for the **Salonique Salon Appointment Booking 
 
 ## 🚀 Live Demo & Repository Links
 
-- **Live Server API**: [https://salonique-api.onrender.com](https://salonique-api.onrender.com) *(Replace with actual deployed URL)*
-- **Server GitHub Repository**: [https://github.com/your-username/salonique-server](https://github.com/your-username/salonique-server)
-- **Client GitHub Repository**: [https://github.com/your-username/salonique-client](https://github.com/your-username/salonique-client)
+- **Live Server API**: Not verified; add the deployed URL before submission
+- **Server GitHub Repository**: [https://github.com/Nafiz-365/Salonique-Server](https://github.com/Nafiz-365/Salonique-Server)
+- **Client GitHub Repository**: [https://github.com/Nafiz-365/Salonique-Client](https://github.com/Nafiz-365/Salonique-Client)
 
 ---
 
@@ -26,7 +26,7 @@ High-performance REST API backend for the **Salonique Salon Appointment Booking 
 - **Stripe Checkout & Webhook Integration**:
   - Creates secure Stripe Checkout sessions for confirmed appointments.
   - `POST /webhook` requires a valid Stripe signature and is disabled until Stripe credentials are configured.
-  - The simulated payment endpoint is available only in development with `ALLOW_DEV_AUTH_FALLBACK=true`; it checks appointment ownership and confirmation status.
+  - Appointment payment status and transactions are updated only by verified Stripe webhook events.
 - **User Access Management**:
   - `GET /users`: Retrieves customer directory.
   - `PATCH /user/:email/toggle-block`: Allows admins to block/unblock users. Blocked users are barred from protected booking features.
@@ -46,26 +46,15 @@ High-performance REST API backend for the **Salonique Salon Appointment Booking 
 
 ## 📋 Environment Variables
 
-Create a `.env` file in the root of the server directory with the following variables (names only):
+Set these variable names in the server `.env` file or deployment environment:
 
-```env
-# Server Port
-PORT=8000
-
-# MongoDB Atlas Connection String
-MONGODB_URI=
-
-# Client Application URL (for CORS and JWKS verification)
-CLIENT_URL=http://localhost:3000
-
-# Stripe Credentials (Test Mode)
-STRIPE_SECRET_KEY=
-STRIPE_WEBHOOK_SECRET=
-
-# Development Flags
-ALLOW_DEV_AUTH_FALLBACK=true
-NODE_ENV=development
-```
+- `PORT`
+- `MONGODB_URI`
+- `CLIENT_URL`
+- `STRIPE_SECRET_KEY`
+- `STRIPE_WEBHOOK_SECRET`
+- `ALLOW_DEV_AUTH_FALLBACK`
+- `NODE_ENV`
 
 > **Security Note**: Never commit actual secret keys or `.env` files to GitHub. Keep `.env` included in `.gitignore`.
 
@@ -81,8 +70,8 @@ NODE_ENV=development
 
 1. **Clone the server repository**:
    ```bash
-   git clone https://github.com/your-username/salonique-server.git
-   cd salonique-server
+   git clone https://github.com/Nafiz-365/Salonique-Server.git
+   cd Salonique-Server
    ```
 
 2. **Install dependencies**:
@@ -92,7 +81,7 @@ NODE_ENV=development
 
 3. **Configure environment variables**:
    ```bash
-   cp .env.example .env
+   Copy-Item .env.example .env
    # Add your MongoDB connection string and Stripe keys to .env
    ```
 
@@ -134,6 +123,7 @@ NODE_ENV=development
 - `GET /users` — View registered customer list with block status
 - `PATCH /user/:email/toggle-block` — Block or unblock customer account
 - `GET /transactions` — View payment history
+- `GET /admin/services` — View active and inactive services
 
 ---
 

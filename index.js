@@ -62,6 +62,14 @@ async function initMongoDB() {
                 time: 1,
                 status: 1,
             }),
+            appointmentsCollection.createIndex(
+                { serviceId: 1, date: 1, time: 1 },
+                {
+                    name: "unique_active_appointment_slot",
+                    unique: true,
+                    partialFilterExpression: { activeSlot: true },
+                },
+            ),
             appointmentsCollection.createIndex({ userEmail: 1, createdAt: -1 }),
             transactionsCollection.createIndex({ appointmentId: 1 }),
         ]);
@@ -73,7 +81,7 @@ async function initMongoDB() {
     }
 }
 
-initMongoDB();
+const mongoInitialization = initMongoDB();
 
 // ─── Stripe Webhook Route (RAW BODY PARSER) ──────────────────────────────────
 // Must be registered before express.json()
@@ -119,10 +127,49 @@ app.post(
                 const filter = ObjectId.isValid(appointmentId)
                     ? { _id: new ObjectId(appointmentId) }
                     : { id: appointmentId };
-                await appointmentsCollection.updateOne(
-                    { ...filter, stripeSessionId: session.id },
-                    { $unset: { stripeSessionId: "" } },
-                );
+                const appointment = await appointmentsCollection.findOne({
+                    ...filter,
+                    stripeSessionId: session.id,
+                });
+                if (appointment) {
+                    await appointmentsCollection.updateOne(
+                        { ...filter, stripeSessionId: session.id },
+                        { $unset: { stripeSessionId: "" } },
+                    );
+
+                    if (
+                        event.type === "checkout.session.async_payment_failed" &&
+                        transactionsCollection &&
+                        !(await transactionsCollection.findOne({
+                            stripeSessionId: session.id,
+                        }))
+                    ) {
+                        const amount = Number.isFinite(session.amount_total)
+                            ? session.amount_total / 100
+                            : Number(appointment.servicePrice);
+                        const now = new Date().toISOString();
+                        await transactionsCollection.insertOne({
+                            appointmentId,
+                            appointmentDate: appointment.date || "",
+                            customerId:
+                                appointment.customerId ||
+                                session.metadata?.userEmail ||
+                                "customer",
+                            customerName:
+                                appointment.userName || "Customer",
+                            customerEmail: appointment.userEmail || "",
+                            serviceName:
+                                appointment.serviceName || "Salon Treatment",
+                            amount,
+                            currency:
+                                session.currency?.toUpperCase() || "USD",
+                            stripeSessionId: session.id,
+                            status: "failed",
+                            createdAt: now,
+                            date: now.split("T")[0],
+                        });
+                    }
+                }
             }
         }
 
@@ -177,19 +224,28 @@ app.post(
                         const amount = session.amount_total / 100;
                         await transactionsCollection.insertOne({
                             appointmentId,
+                            appointmentDate: appointment.date || "",
                             customerId:
-                                session.metadata?.userEmail || "customer",
+                                appointment.customerId ||
+                                session.metadata?.userEmail ||
+                                "customer",
                             customerName:
-                                session.metadata?.userName || "Customer",
-                            customerEmail: session.metadata?.userEmail || "",
+                                appointment.userName ||
+                                session.metadata?.userName ||
+                                "Customer",
+                            customerEmail:
+                                appointment.userEmail ||
+                                session.metadata?.userEmail ||
+                                "",
                             serviceName:
+                                appointment.serviceName ||
                                 session.metadata?.serviceName ||
                                 "Salon Treatment",
                             amount,
                             currency:
                                 session.currency?.toUpperCase() || "USD",
                             stripeSessionId: session.id,
-                            status: "succeeded",
+                            status: "paid",
                             createdAt: new Date().toISOString(),
                             date: new Date().toISOString().split("T")[0],
                         });
@@ -256,21 +312,27 @@ export const verifyToken = async (req, res, next) => {
 
 // Check if authenticated user is blocked
 async function checkBlockedUser(req, res, next) {
-    if (usersCollection && req.user?.email) {
-        try {
-            const dbUser = await usersCollection.findOne({
-                email: req.user.email.toLowerCase(),
-            });
-            if (dbUser && dbUser.isBlocked) {
-                return res.status(403).json({
-                    error: "Account Blocked: Access to protected platform features has been restricted.",
-                });
-            }
-        } catch {
-            // Continue if DB check fails
-        }
+    if (!usersCollection) {
+        return res.status(503).json({
+            error: "User access cannot be verified while the database is unavailable.",
+        });
     }
-    next();
+    try {
+        const dbUser = await usersCollection.findOne({
+            email: req.user.email.toLowerCase(),
+        });
+        if (dbUser?.isBlocked || dbUser?.status === "suspended") {
+            return res.status(403).json({
+                error: "Account Blocked: Access to protected platform features has been restricted.",
+            });
+        }
+        return next();
+    } catch (err) {
+        console.error("Blocked-user check failed:", err.message);
+        return res.status(503).json({
+            error: "User access could not be verified. Please try again.",
+        });
+    }
 }
 
 // ─── Admin Role Verification Middleware ──────────────────────────────────────
@@ -300,8 +362,15 @@ app.get("/", (req, res) => {
 // GET /services - Filtered Discovery with Search & Sorting
 app.get("/services", async (req, res) => {
     try {
-        const { category, search, minPrice, maxPrice, sort, location } =
-            req.query;
+        const {
+            category,
+            search,
+            minPrice,
+            maxPrice,
+            sort,
+            location,
+            featured,
+        } = req.query;
         const page = Math.max(1, Number.parseInt(req.query.page, 10) || 1);
         const limit = Math.min(
             100,
@@ -315,6 +384,9 @@ app.get("/services", async (req, res) => {
         }
 
         const query = { isActive: true }; // Only active services visible on public browse
+        if (featured === "true") {
+            query.featured = true;
+        }
         if (category && category !== "All") {
             query.category = category;
         }
@@ -414,29 +486,54 @@ app.get("/service/:id", async (req, res) => {
 
 // ─── Admin Services Management ───────────────────────────────────────────────
 
+// GET /admin/services (Protected, Admin Only)
+app.get("/admin/services", verifyToken, verifyAdmin, async (req, res) => {
+    try {
+        if (!servicesCollection) {
+            return res.status(503).json({ error: "Database not connected." });
+        }
+
+        const services = await servicesCollection
+            .find()
+            .sort({ createdAt: -1 })
+            .toArray();
+        return res.json({ services, total: services.length });
+    } catch (err) {
+        return res.status(500).json({
+            error: "Failed to fetch admin services",
+            details: err.message,
+        });
+    }
+});
+
 // POST /services (Protected, Admin Only)
 app.post("/services", verifyToken, verifyAdmin, async (req, res) => {
     try {
         const data = req.body;
-        if (!data.name || !data.category) {
+        const svcName =
+            typeof data.name === "string"
+                ? data.name.trim()
+                : typeof data.serviceName === "string"
+                  ? data.serviceName.trim()
+                  : "";
+        if (!svcName || typeof data.category !== "string" || !data.category.trim()) {
             return res
                 .status(400)
                 .json({ error: "Service name and category are required." });
         }
         const price = Number(data.price);
         const duration = Number(data.duration);
-        if (isNaN(price) || price <= 0) {
+        if (!Number.isFinite(price) || price <= 0) {
             return res
                 .status(400)
                 .json({ error: "Price must be a positive number." });
         }
-        if (isNaN(duration) || duration <= 0) {
+        if (!Number.isFinite(duration) || duration <= 0) {
             return res
                 .status(400)
                 .json({ error: "Duration must be a positive number." });
         }
 
-        const svcName = (data.name || data.serviceName || "").trim();
         const isActive =
             data.isActive !== undefined
                 ? Boolean(data.isActive)
@@ -477,17 +574,60 @@ app.patch("/services/:id", verifyToken, verifyAdmin, async (req, res) => {
     try {
         const { id } = req.params;
         const updateData = { ...req.body, updatedAt: new Date().toISOString() };
-        if (updateData.price) updateData.price = Number(updateData.price);
-        if (updateData.duration)
+        if (Object.hasOwn(updateData, "price")) {
+            updateData.price = Number(updateData.price);
+            if (!Number.isFinite(updateData.price) || updateData.price <= 0) {
+                return res
+                    .status(400)
+                    .json({ error: "Price must be a positive number." });
+            }
+        }
+        if (Object.hasOwn(updateData, "duration")) {
             updateData.duration = Number(updateData.duration);
-        if (updateData.name && !updateData.serviceName)
-            updateData.serviceName = updateData.name;
-        if (updateData.serviceName && !updateData.name)
-            updateData.name = updateData.serviceName;
-        if (updateData.isActive !== undefined)
+            if (
+                !Number.isFinite(updateData.duration) ||
+                updateData.duration <= 0
+            ) {
+                return res
+                    .status(400)
+                    .json({ error: "Duration must be a positive number." });
+            }
+        }
+        if (
+            Object.hasOwn(updateData, "name") ||
+            Object.hasOwn(updateData, "serviceName")
+        ) {
+            const name =
+                typeof updateData.name === "string"
+                    ? updateData.name
+                    : updateData.serviceName;
+            if (typeof name !== "string" || !name.trim()) {
+                return res
+                    .status(400)
+                    .json({ error: "Service name cannot be empty." });
+            }
+            updateData.name = name.trim();
+            updateData.serviceName = name.trim();
+            updateData.slug = name
+                .trim()
+                .toLowerCase()
+                .replace(/[^a-z0-9]+/g, "-");
+        }
+        if (Object.hasOwn(updateData, "isActive")) {
+            if (typeof updateData.isActive !== "boolean") {
+                return res
+                    .status(400)
+                    .json({ error: "Service status must be active or inactive." });
+            }
             updateData.status = updateData.isActive ? "active" : "inactive";
-        else if (updateData.status !== undefined)
+        } else if (Object.hasOwn(updateData, "status")) {
+            if (!["active", "inactive"].includes(updateData.status)) {
+                return res
+                    .status(400)
+                    .json({ error: "Service status must be active or inactive." });
+            }
             updateData.isActive = updateData.status === "active";
+        }
 
         if (servicesCollection) {
             const filter = ObjectId.isValid(id)
@@ -496,6 +636,9 @@ app.patch("/services/:id", verifyToken, verifyAdmin, async (req, res) => {
             const result = await servicesCollection.updateOne(filter, {
                 $set: updateData,
             });
+            if (result.matchedCount === 0) {
+                return res.status(404).json({ error: "Service not found." });
+            }
             return res.json({
                 message: "Service updated successfully!",
                 modifiedCount: result.modifiedCount,
@@ -518,6 +661,23 @@ app.delete("/services/:id", verifyToken, verifyAdmin, async (req, res) => {
             const filter = ObjectId.isValid(id)
                 ? { _id: new ObjectId(id) }
                 : { slug: id };
+            const service = await servicesCollection.findOne(filter);
+            if (!service) {
+                return res.status(404).json({ error: "Service not found." });
+            }
+            if (appointmentsCollection) {
+                const activeBookings =
+                    await appointmentsCollection.countDocuments({
+                        serviceId: service._id.toString(),
+                        status: { $in: ["pending", "confirmed"] },
+                        paymentStatus: { $ne: "paid" },
+                    });
+                if (activeBookings > 0) {
+                    return res.status(409).json({
+                        error: "Cancel pending or confirmed unpaid appointments before deleting this service.",
+                    });
+                }
+            }
             const result = await servicesCollection.deleteOne(filter);
             return res.json({
                 message: "Service removed successfully!",
@@ -669,6 +829,7 @@ app.post("/booking", verifyToken, async (req, res) => {
             notes: message,
             status: "pending",
             paymentStatus: "unpaid",
+            activeSlot: true,
             createdAt: new Date().toISOString(),
         };
 
@@ -679,6 +840,11 @@ app.post("/booking", verifyToken, async (req, res) => {
             appointment: { ...newAppointment, _id: result.insertedId },
         });
     } catch (err) {
+        if (err.code === 11000) {
+            return res.status(409).json({
+                error: "This time slot has already been reserved. Please select another time.",
+            });
+        }
         res.status(500).json({
             error: "Failed to reserve appointment",
             details: err.message,
@@ -743,11 +909,7 @@ app.patch(
         try {
             const { id } = req.params;
             const { status } = req.body;
-            if (
-                !["pending", "confirmed", "completed", "cancelled"].includes(
-                    status,
-                )
-            ) {
+            if (!["pending", "confirmed", "cancelled"].includes(status)) {
                 return res.status(400).json({ error: "Invalid status value." });
             }
 
@@ -768,16 +930,34 @@ app.patch(
                         error: "Only pending appointments can be confirmed.",
                     });
                 }
+                if (
+                    status === "cancelled" &&
+                    !["pending", "confirmed"].includes(current.status)
+                ) {
+                    return res.status(400).json({
+                        error: "Only pending or confirmed appointments can be cancelled.",
+                    });
+                }
+                if (status === "pending" && current.status !== "pending") {
+                    return res.status(400).json({
+                        error: "Appointments cannot be moved back to pending.",
+                    });
+                }
 
+                const update = {
+                    status,
+                    updatedAt: new Date().toISOString(),
+                };
+                if (status === "cancelled") update.activeSlot = false;
                 const result = await appointmentsCollection.updateOne(filter, {
-                    $set: { status, updatedAt: new Date().toISOString() },
+                    $set: update,
                 });
                 return res.json({
                     message: `Appointment status updated to ${status}`,
                     modifiedCount: result.modifiedCount,
                 });
             }
-            res.json({ message: `Status updated to ${status}` });
+            return res.status(503).json({ error: "Database not connected." });
         } catch (err) {
             res.status(500).json({
                 error: "Failed to update appointment",
@@ -803,7 +983,13 @@ app.patch("/appointment/:id/cancel", verifyToken, async (req, res) => {
                     .json({ error: "Appointment not found." });
 
             // Customer can cancel only their own pending appointment
-            if (req.user?.role !== "admin") {
+            if (req.user?.role === "admin") {
+                if (!["pending", "confirmed"].includes(apt.status)) {
+                    return res.status(400).json({
+                        error: "Only pending or confirmed appointments can be cancelled.",
+                    });
+                }
+            } else {
                 if (
                     apt.userEmail?.toLowerCase() !==
                     req.user.email.toLowerCase()
@@ -822,6 +1008,7 @@ app.patch("/appointment/:id/cancel", verifyToken, async (req, res) => {
             await appointmentsCollection.updateOne(filter, {
                 $set: {
                     status: "cancelled",
+                    activeSlot: false,
                     cancelledAt: new Date().toISOString(),
                 },
             });
@@ -1040,7 +1227,7 @@ app.get("/users", verifyToken, verifyAdmin, async (req, res) => {
         let list = [];
         if (usersCollection) {
             list = await usersCollection
-                .find()
+                .find({ role: { $ne: "admin" } })
                 .sort({ createdAt: -1 })
                 .toArray();
         }
@@ -1142,7 +1329,14 @@ app.get("/verify-session/:sessionId", verifyToken, async (req, res) => {
     }
 });
 
-// Start Server
-app.listen(PORT, () => {
-    console.log(`Salonique API Server running at http://localhost:${PORT}`);
-});
+// Start accepting requests only after database indexes are ready.
+mongoInitialization
+    .then(() => {
+        app.listen(PORT, () => {
+            console.log(`Salonique API Server running at http://localhost:${PORT}`);
+        });
+    })
+    .catch((err) => {
+        console.error("Failed to initialize the API server:", err);
+        process.exitCode = 1;
+    });
