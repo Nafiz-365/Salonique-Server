@@ -109,47 +109,91 @@ app.post(
             return res.status(400).send(`Webhook Error: ${err.message}`);
         }
 
-        if (event.type === "checkout.session.completed") {
+        if (
+            event.type === "checkout.session.expired" ||
+            event.type === "checkout.session.async_payment_failed"
+        ) {
             const session = event.data.object;
             const appointmentId = session.metadata?.appointmentId;
-            const amount = session.amount_total
-                ? session.amount_total / 100
-                : 0;
-
             if (appointmentId && appointmentsCollection) {
                 const filter = ObjectId.isValid(appointmentId)
                     ? { _id: new ObjectId(appointmentId) }
                     : { id: appointmentId };
+                await appointmentsCollection.updateOne(
+                    { ...filter, stripeSessionId: session.id },
+                    { $unset: { stripeSessionId: "" } },
+                );
+            }
+        }
 
-                await appointmentsCollection.updateOne(filter, {
-                    $set: {
-                        paymentStatus: "paid",
-                        status: "confirmed",
-                        stripeSessionId: session.id,
-                        paidAt: new Date().toISOString(),
-                    },
-                });
+        if (
+            event.type === "checkout.session.completed" ||
+            event.type === "checkout.session.async_payment_succeeded"
+        ) {
+            const session = event.data.object;
+            const appointmentId = session.metadata?.appointmentId;
+            if (
+                session.payment_status === "paid" &&
+                appointmentId &&
+                appointmentsCollection
+            ) {
+                const filter = ObjectId.isValid(appointmentId)
+                    ? { _id: new ObjectId(appointmentId) }
+                    : { id: appointmentId };
+                const appointment =
+                    await appointmentsCollection.findOne(filter);
+                const expectedAmount = Math.round(
+                    Number(appointment?.servicePrice) * 100,
+                );
+                const sessionEmail = session.metadata?.userEmail
+                    ?.toLowerCase();
 
                 if (
-                    transactionsCollection &&
-                    !(await transactionsCollection.findOne({
-                        stripeSessionId: session.id,
-                    }))
+                    !appointment ||
+                    !sessionEmail ||
+                    sessionEmail !== appointment.userEmail?.toLowerCase() ||
+                    !Number.isFinite(expectedAmount) ||
+                    session.amount_total !== expectedAmount ||
+                    session.currency !== "usd"
                 ) {
-                    await transactionsCollection.insertOne({
-                        appointmentId,
-                        customerId: session.metadata?.userEmail || "customer",
-                        customerName: session.metadata?.userName || "Customer",
-                        customerEmail: session.metadata?.userEmail || "",
-                        serviceName:
-                            session.metadata?.serviceName || "Salon Treatment",
-                        amount,
-                        currency: session.currency?.toUpperCase() || "USD",
-                        stripeSessionId: session.id,
-                        status: "succeeded",
-                        createdAt: new Date().toISOString(),
-                        date: new Date().toISOString().split("T")[0],
+                    console.error(
+                        `Ignoring paid Checkout Session ${session.id}: appointment, customer, amount, or currency did not match.`,
+                    );
+                } else {
+                    await appointmentsCollection.updateOne(filter, {
+                        $set: {
+                            paymentStatus: "paid",
+                            stripeSessionId: session.id,
+                            paidAt: new Date().toISOString(),
+                        },
                     });
+
+                    if (
+                        transactionsCollection &&
+                        !(await transactionsCollection.findOne({
+                            stripeSessionId: session.id,
+                        }))
+                    ) {
+                        const amount = session.amount_total / 100;
+                        await transactionsCollection.insertOne({
+                            appointmentId,
+                            customerId:
+                                session.metadata?.userEmail || "customer",
+                            customerName:
+                                session.metadata?.userName || "Customer",
+                            customerEmail: session.metadata?.userEmail || "",
+                            serviceName:
+                                session.metadata?.serviceName ||
+                                "Salon Treatment",
+                            amount,
+                            currency:
+                                session.currency?.toUpperCase() || "USD",
+                            stripeSessionId: session.id,
+                            status: "succeeded",
+                            createdAt: new Date().toISOString(),
+                            date: new Date().toISOString().split("T")[0],
+                        });
+                    }
                 }
             }
         }
@@ -494,36 +538,65 @@ app.delete("/services/:id", verifyToken, verifyAdmin, async (req, res) => {
 // POST /booking (Protected, Customer Only)
 app.post("/booking", verifyToken, async (req, res) => {
     try {
-        if (req.user?.role === "admin") {
+        if (req.user?.role !== "customer") {
             return res.status(403).json({
-                error: "Admins cannot submit customer appointment requests.",
+                error: "Only customer accounts can submit appointment requests.",
             });
         }
 
-        const data = {
-            ...req.body,
-            userEmail: req.user.email.toLowerCase(),
-            userName: req.user?.name || req.body.userName,
-        };
-        const { serviceId, date, time } = data;
-
-        if (!serviceId || !date || !time) {
+        const { serviceId, date, time } = req.body;
+        if (
+            typeof serviceId !== "string" ||
+            !serviceId.trim() ||
+            typeof date !== "string" ||
+            typeof time !== "string" ||
+            !time.trim()
+        ) {
             return res.status(400).json({
                 error: "Missing required booking details (serviceId, date, time).",
             });
         }
 
-        // Check service is active
-        if (servicesCollection) {
-            const svcFilter = ObjectId.isValid(serviceId)
-                ? { _id: new ObjectId(serviceId) }
-                : { slug: serviceId };
-            const svc = await servicesCollection.findOne(svcFilter);
-            if (svc && svc.isActive === false) {
-                return res.status(400).json({
-                    error: "This service is inactive and cannot be booked.",
-                });
-            }
+        if (!servicesCollection || !appointmentsCollection) {
+            return res.status(503).json({ error: "Database not connected." });
+        }
+
+        const normalizedServiceId = serviceId.trim();
+        const svcFilter = ObjectId.isValid(normalizedServiceId)
+            ? { _id: new ObjectId(normalizedServiceId) }
+            : { slug: normalizedServiceId };
+        const service = await servicesCollection.findOne(svcFilter);
+        if (!service) {
+            return res.status(404).json({ error: "Service not found." });
+        }
+        if (service.isActive === false) {
+            return res.status(400).json({
+                error: "This service is inactive and cannot be booked.",
+            });
+        }
+
+        const servicePrice = Number(service.price);
+        const serviceDuration = Number(service.duration);
+        if (
+            !Number.isFinite(servicePrice) ||
+            servicePrice <= 0 ||
+            !Number.isFinite(serviceDuration) ||
+            serviceDuration <= 0
+        ) {
+            return res.status(400).json({
+                error: "This service is not configured for booking.",
+            });
+        }
+
+        const parsedDate = new Date(`${date}T00:00:00.000Z`);
+        if (
+            !/^\d{4}-\d{2}-\d{2}$/.test(date) ||
+            Number.isNaN(parsedDate.getTime()) ||
+            parsedDate.toISOString().slice(0, 10) !== date
+        ) {
+            return res.status(400).json({
+                error: "Please select a valid appointment date.",
+            });
         }
 
         // Check future date
@@ -535,51 +608,76 @@ app.post("/booking", verifyToken, async (req, res) => {
         }
 
         // Prevent duplicate active appointments for same date and time slot
-        if (appointmentsCollection) {
-            const collision = await appointmentsCollection.findOne({
-                serviceId,
-                date,
-                time,
-                status: { $in: ["confirmed", "pending"] },
-            });
+        const storedServiceId = service._id.toString();
+        const collision = await appointmentsCollection.findOne({
+            serviceId: storedServiceId,
+            date,
+            time: time.trim(),
+            status: { $in: ["confirmed", "pending"] },
+        });
 
-            if (collision) {
-                return res.status(409).json({
-                    error: "Double-booking collision detected.",
-                    message: `This time slot (${time} on ${date}) is already reserved. Please select another slot.`,
-                });
-            }
+        if (collision) {
+            return res.status(409).json({
+                error: "Double-booking collision detected.",
+                message: `This time slot (${time} on ${date}) is already reserved. Please select another slot.`,
+            });
         }
 
-        const appointmentDate = date || data.appointmentDate;
-        const timeSlot = time || data.timeSlot;
-        const message = data.message || data.notes || "";
+        const userEmail = req.user.email.toLowerCase();
+        const userName =
+            (typeof req.user.name === "string" && req.user.name.trim()) ||
+            (typeof req.body.userName === "string" &&
+                req.body.userName.trim()) ||
+            "Customer";
+        const message =
+            typeof req.body.notes === "string"
+                ? req.body.notes.trim()
+                : typeof req.body.message === "string"
+                  ? req.body.message.trim()
+                  : "";
+        const specialist =
+            service.specialist &&
+            typeof service.specialist === "object" &&
+            typeof service.specialist.name === "string"
+                ? service.specialist.name
+                : typeof service.specialistName === "string"
+                  ? service.specialistName
+                  : "Salon Specialist";
+        const customerId = req.user.sub || req.user.id || userEmail;
         const newAppointment = {
-            ...data,
-            customerId: data.customerId || req.user.id || req.user.email,
-            userId: req.user.email,
-            appointmentDate,
-            timeSlot,
+            customerId,
+            userId: customerId,
+            userEmail,
+            userName,
+            userPhone:
+                typeof req.body.userPhone === "string"
+                    ? req.body.userPhone.trim()
+                    : "",
+            serviceId: storedServiceId,
+            serviceName: service.name,
+            serviceCategory: service.category || "",
+            servicePrice,
+            serviceDuration,
+            serviceImage: service.image || "",
+            date,
+            appointmentDate: date,
+            time: time.trim(),
+            timeSlot: time.trim(),
+            specialist,
+            location: service.location || "",
             message,
             notes: message,
-            servicePrice: Number(data.servicePrice || 100),
-            serviceDuration: Number(data.serviceDuration || 60),
             status: "pending",
             paymentStatus: "unpaid",
             createdAt: new Date().toISOString(),
         };
 
-        if (appointmentsCollection) {
-            const result =
-                await appointmentsCollection.insertOne(newAppointment);
-            return res.status(201).json({
-                message: "Appointment request submitted successfully!",
-                insertedId: result.insertedId,
-                appointment: { ...newAppointment, _id: result.insertedId },
-            });
-        }
-
-        return res.status(503).json({ error: "Database not connected." });
+        const result = await appointmentsCollection.insertOne(newAppointment);
+        return res.status(201).json({
+            message: "Appointment request submitted successfully!",
+            insertedId: result.insertedId,
+            appointment: { ...newAppointment, _id: result.insertedId },
+        });
     } catch (err) {
         res.status(500).json({
             error: "Failed to reserve appointment",
@@ -744,7 +842,7 @@ app.patch("/appointment/:id/cancel", verifyToken, async (req, res) => {
 app.post("/create-checkout-session", verifyToken, async (req, res) => {
     try {
         const { appointmentId } = req.body;
-        if (!appointmentId) {
+        if (typeof appointmentId !== "string" || !appointmentId.trim()) {
             return res
                 .status(400)
                 .json({ error: "appointmentId is required." });
@@ -754,18 +852,21 @@ app.post("/create-checkout-session", verifyToken, async (req, res) => {
             return res.status(503).json({ error: "Database not connected." });
         }
 
-        const filter = ObjectId.isValid(appointmentId)
-            ? { _id: new ObjectId(appointmentId) }
-            : { id: appointmentId };
+        const normalizedAppointmentId = appointmentId.trim();
+        const filter = ObjectId.isValid(normalizedAppointmentId)
+            ? { _id: new ObjectId(normalizedAppointmentId) }
+            : { id: normalizedAppointmentId };
 
         const apt = await appointmentsCollection.findOne(filter);
         if (!apt) {
             return res.status(404).json({ error: "Appointment not found." });
         }
-        if (
-            req.user?.role !== "admin" &&
-            apt.userEmail?.toLowerCase() !== req.user?.email?.toLowerCase()
-        ) {
+        if (req.user?.role !== "customer") {
+            return res.status(403).json({
+                error: "Only customer accounts can pay for appointments.",
+            });
+        }
+        if (apt.userEmail?.toLowerCase() !== req.user?.email?.toLowerCase()) {
             return res.status(403).json({
                 error: "You can only pay for your own appointments.",
             });
@@ -784,10 +885,79 @@ app.post("/create-checkout-session", verifyToken, async (req, res) => {
                 .json({ error: "This appointment has already been paid." });
         }
 
+        if (!servicesCollection) {
+            return res.status(503).json({ error: "Database not connected." });
+        }
         if (!stripe) {
             return res.status(503).json({
                 error: "Stripe is not configured. Online checkout is unavailable.",
             });
+        }
+
+        const serviceId = String(apt.serviceId || "");
+        const serviceFilter = ObjectId.isValid(serviceId)
+            ? { _id: new ObjectId(serviceId) }
+            : { slug: serviceId };
+        const service = await servicesCollection.findOne(serviceFilter);
+        if (!service) {
+            return res.status(409).json({
+                error: "The service for this appointment is no longer available.",
+            });
+        }
+        const servicePrice = Number(service.price);
+        const amountInCents = Math.round(servicePrice * 100);
+        const appointmentAmountInCents = Math.round(
+            Number(apt.servicePrice) * 100,
+        );
+        if (
+            !Number.isFinite(servicePrice) ||
+            amountInCents <= 0 ||
+            !Number.isFinite(appointmentAmountInCents)
+        ) {
+            return res.status(400).json({
+                error: "This appointment has an invalid payment amount.",
+            });
+        }
+        if (appointmentAmountInCents !== amountInCents) {
+            if (apt.stripeSessionId) {
+                const previousSession = await stripe.checkout.sessions.retrieve(
+                    apt.stripeSessionId,
+                );
+                if (previousSession.status === "complete") {
+                    return res.status(409).json({
+                        error: "Payment is already processing for this appointment.",
+                    });
+                }
+                if (previousSession.status === "open") {
+                    await stripe.checkout.sessions.expire(
+                        previousSession.id,
+                    );
+                }
+            }
+            await appointmentsCollection.updateOne(filter, {
+                $set: { servicePrice },
+                $unset: { stripeSessionId: "" },
+            });
+            return res.status(409).json({
+                error: "The service price changed. Refresh the appointments page to review the updated price before paying.",
+            });
+        }
+
+        if (apt.stripeSessionId) {
+            const existingSession = await stripe.checkout.sessions.retrieve(
+                apt.stripeSessionId,
+            );
+            if (existingSession.status === "open" && existingSession.url) {
+                return res.json({
+                    url: existingSession.url,
+                    sessionId: existingSession.id,
+                });
+            }
+            if (existingSession.status === "complete") {
+                return res.status(409).json({
+                    error: "Payment is already processing for this appointment.",
+                });
+            }
         }
 
         // Ensure valid public image URL if provided
@@ -807,109 +977,37 @@ app.post("/create-checkout-session", verifyToken, async (req, res) => {
                             description: `Appointment with ${apt.specialist} on ${apt.date} at ${apt.time}`,
                             images: validImages,
                         },
-                        unit_amount: Math.round(Number(apt.servicePrice) * 100),
+                        unit_amount: amountInCents,
                     },
                     quantity: 1,
                 },
             ],
+            client_reference_id: apt._id.toString(),
+            customer_email: apt.userEmail,
             metadata: {
                 appointmentId: apt._id.toString(),
                 userEmail: apt.userEmail,
                 userName: apt.userName,
                 serviceName: apt.serviceName,
             },
-            success_url: `${CLIENT_URL}/checkout/success?aptId=${apt._id}&session_id={CHECKOUT_SESSION_ID}`,
+            success_url: `${CLIENT_URL}/checkout/success?aptId=${apt._id}`,
             cancel_url: `${CLIENT_URL}/checkout/cancel?aptId=${apt._id}`,
+        });
+
+        if (!session.url) {
+            return res.status(502).json({
+                error: "Stripe did not return a Checkout URL.",
+            });
+        }
+
+        await appointmentsCollection.updateOne(filter, {
+            $set: { stripeSessionId: session.id },
         });
 
         res.json({ url: session.url, sessionId: session.id });
     } catch (err) {
         res.status(500).json({
             error: "Failed to create Stripe session",
-            details: err.message,
-        });
-    }
-});
-
-// PATCH /appointment/:id/pay (Fallback simulation for development)
-app.patch("/appointment/:id/pay", verifyToken, async (req, res) => {
-    try {
-        if (
-            process.env.NODE_ENV !== "development" ||
-            process.env.ALLOW_DEV_AUTH_FALLBACK !== "true"
-        ) {
-            return res.status(404).json({ error: "Not found." });
-        }
-
-        const { id } = req.params;
-        const { paymentMethod } = req.body;
-
-        const filter = ObjectId.isValid(id)
-            ? { _id: new ObjectId(id) }
-            : { id };
-
-        if (appointmentsCollection) {
-            const apt = await appointmentsCollection.findOne(filter);
-            if (!apt)
-                return res
-                    .status(404)
-                    .json({ error: "Appointment not found." });
-
-            if (
-                req.user?.role !== "admin" &&
-                apt.userEmail?.toLowerCase() !== req.user?.email?.toLowerCase()
-            ) {
-                return res.status(403).json({
-                    error: "You can only pay for your own appointments.",
-                });
-            }
-            if (apt.status !== "confirmed") {
-                return res.status(400).json({
-                    error: "Only confirmed appointments can be paid.",
-                });
-            }
-            if (apt.paymentStatus === "paid") {
-                return res.status(409).json({
-                    error: "This appointment has already been paid.",
-                });
-            }
-
-            const txnId = `txn-${Date.now()}`;
-            await appointmentsCollection.updateOne(filter, {
-                $set: {
-                    paymentStatus: "paid",
-                    paymentMethod: paymentMethod || "Credit Card (Visa 4242)",
-                    transactionId: txnId,
-                    paidAt: new Date().toISOString(),
-                },
-            });
-
-            if (transactionsCollection) {
-                await transactionsCollection.insertOne({
-                    appointmentId: id,
-                    customerId: apt.userEmail,
-                    customerName: apt.userName,
-                    customerEmail: apt.userEmail,
-                    serviceName: apt.serviceName,
-                    amount: Number(apt.servicePrice),
-                    currency: "USD",
-                    status: "succeeded",
-                    paymentMethod: paymentMethod || "Credit Card (Visa 4242)",
-                    createdAt: new Date().toISOString(),
-                    date: new Date().toISOString().split("T")[0],
-                });
-            }
-
-            return res.json({
-                message: "Payment processed successfully!",
-                transactionId: txnId,
-            });
-        }
-
-        return res.status(503).json({ error: "Database not connected." });
-    } catch (err) {
-        res.status(500).json({
-            error: "Failed to process payment",
             details: err.message,
         });
     }
@@ -1018,60 +1116,24 @@ app.patch(
     },
 );
 
-// GET /verify-session/:sessionId (Verifies payment on return)
-app.get("/verify-session/:sessionId", async (req, res) => {
+// GET /verify-session/:sessionId (Read-only status check)
+app.get("/verify-session/:sessionId", verifyToken, async (req, res) => {
     try {
         const { sessionId } = req.params;
         if (!stripe) {
             return res.status(400).json({ error: "Stripe not configured." });
         }
         const session = await stripe.checkout.sessions.retrieve(sessionId);
-        if (session.payment_status === "paid") {
-            const appointmentId = session.metadata?.appointmentId;
-            if (appointmentId && appointmentsCollection) {
-                const filter = ObjectId.isValid(appointmentId)
-                    ? { _id: new ObjectId(appointmentId) }
-                    : { id: appointmentId };
-
-                await appointmentsCollection.updateOne(filter, {
-                    $set: {
-                        paymentStatus: "paid",
-                        status: "confirmed",
-                        stripeSessionId: session.id,
-                        paidAt: new Date().toISOString(),
-                    },
-                });
-
-                if (transactionsCollection) {
-                    const existing = await transactionsCollection.findOne({
-                        stripeSessionId: session.id,
-                    });
-                    if (!existing) {
-                        await transactionsCollection.insertOne({
-                            appointmentId,
-                            customerId:
-                                session.metadata?.userEmail || "customer",
-                            customerName:
-                                session.metadata?.userName || "Customer",
-                            customerEmail: session.metadata?.userEmail || "",
-                            serviceName:
-                                session.metadata?.serviceName ||
-                                "Salon Treatment",
-                            amount: session.amount_total
-                                ? session.amount_total / 100
-                                : 0,
-                            currency: session.currency?.toUpperCase() || "USD",
-                            stripeSessionId: session.id,
-                            status: "succeeded",
-                            createdAt: new Date().toISOString(),
-                            date: new Date().toISOString().split("T")[0],
-                        });
-                    }
-                }
-            }
-            return res.json({ verified: true, status: "paid" });
+        const sessionEmail = session.metadata?.userEmail?.toLowerCase();
+        if (sessionEmail !== req.user?.email?.toLowerCase()) {
+            return res.status(403).json({
+                error: "You can only verify your own checkout session.",
+            });
         }
-        res.json({ verified: false, status: session.payment_status });
+        return res.json({
+            verified: session.payment_status === "paid",
+            status: session.payment_status,
+        });
     } catch (err) {
         res.status(500).json({
             error: "Failed to verify session",
