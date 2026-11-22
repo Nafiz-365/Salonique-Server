@@ -138,7 +138,8 @@ app.post(
                     );
 
                     if (
-                        event.type === "checkout.session.async_payment_failed" &&
+                        event.type ===
+                            "checkout.session.async_payment_failed" &&
                         transactionsCollection &&
                         !(await transactionsCollection.findOne({
                             stripeSessionId: session.id,
@@ -155,14 +156,12 @@ app.post(
                                 appointment.customerId ||
                                 session.metadata?.userEmail ||
                                 "customer",
-                            customerName:
-                                appointment.userName || "Customer",
+                            customerName: appointment.userName || "Customer",
                             customerEmail: appointment.userEmail || "",
                             serviceName:
                                 appointment.serviceName || "Salon Treatment",
                             amount,
-                            currency:
-                                session.currency?.toUpperCase() || "USD",
+                            currency: session.currency?.toUpperCase() || "USD",
                             stripeSessionId: session.id,
                             status: "failed",
                             createdAt: now,
@@ -192,8 +191,7 @@ app.post(
                 const expectedAmount = Math.round(
                     Number(appointment?.servicePrice) * 100,
                 );
-                const sessionEmail = session.metadata?.userEmail
-                    ?.toLowerCase();
+                const sessionEmail = session.metadata?.userEmail?.toLowerCase();
 
                 if (
                     !appointment ||
@@ -242,8 +240,7 @@ app.post(
                                 session.metadata?.serviceName ||
                                 "Salon Treatment",
                             amount,
-                            currency:
-                                session.currency?.toUpperCase() || "USD",
+                            currency: session.currency?.toUpperCase() || "USD",
                             stripeSessionId: session.id,
                             status: "paid",
                             createdAt: new Date().toISOString(),
@@ -516,7 +513,11 @@ app.post("/services", verifyToken, verifyAdmin, async (req, res) => {
                 : typeof data.serviceName === "string"
                   ? data.serviceName.trim()
                   : "";
-        if (!svcName || typeof data.category !== "string" || !data.category.trim()) {
+        if (
+            !svcName ||
+            typeof data.category !== "string" ||
+            !data.category.trim()
+        ) {
             return res
                 .status(400)
                 .json({ error: "Service name and category are required." });
@@ -617,14 +618,18 @@ app.patch("/services/:id", verifyToken, verifyAdmin, async (req, res) => {
             if (typeof updateData.isActive !== "boolean") {
                 return res
                     .status(400)
-                    .json({ error: "Service status must be active or inactive." });
+                    .json({
+                        error: "Service status must be active or inactive.",
+                    });
             }
             updateData.status = updateData.isActive ? "active" : "inactive";
         } else if (Object.hasOwn(updateData, "status")) {
             if (!["active", "inactive"].includes(updateData.status)) {
                 return res
                     .status(400)
-                    .json({ error: "Service status must be active or inactive." });
+                    .json({
+                        error: "Service status must be active or inactive.",
+                    });
             }
             updateData.isActive = updateData.status === "active";
         }
@@ -1116,9 +1121,7 @@ app.post("/create-checkout-session", verifyToken, async (req, res) => {
                     });
                 }
                 if (previousSession.status === "open") {
-                    await stripe.checkout.sessions.expire(
-                        previousSession.id,
-                    );
+                    await stripe.checkout.sessions.expire(previousSession.id);
                 }
             }
             await appointmentsCollection.updateOne(filter, {
@@ -1333,7 +1336,9 @@ app.get("/verify-session/:sessionId", verifyToken, async (req, res) => {
 mongoInitialization
     .then(() => {
         app.listen(PORT, () => {
-            console.log(`Salonique API Server running at http://localhost:${PORT}`);
+            console.log(
+                `Salonique API Server running at http://localhost:${PORT}`,
+            );
         });
     })
     .catch((err) => {
