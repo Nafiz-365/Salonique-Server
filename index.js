@@ -616,20 +616,16 @@ app.patch("/services/:id", verifyToken, verifyAdmin, async (req, res) => {
         }
         if (Object.hasOwn(updateData, "isActive")) {
             if (typeof updateData.isActive !== "boolean") {
-                return res
-                    .status(400)
-                    .json({
-                        error: "Service status must be active or inactive.",
-                    });
+                return res.status(400).json({
+                    error: "Service status must be active or inactive.",
+                });
             }
             updateData.status = updateData.isActive ? "active" : "inactive";
         } else if (Object.hasOwn(updateData, "status")) {
             if (!["active", "inactive"].includes(updateData.status)) {
-                return res
-                    .status(400)
-                    .json({
-                        error: "Service status must be active or inactive.",
-                    });
+                return res.status(400).json({
+                    error: "Service status must be active or inactive.",
+                });
             }
             updateData.isActive = updateData.status === "active";
         }
