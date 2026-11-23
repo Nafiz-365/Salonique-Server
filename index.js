@@ -12,6 +12,12 @@ const ALLOW_DEV_AUTH_FALLBACK =
     process.env.NODE_ENV !== "production" &&
     process.env.ALLOW_DEV_AUTH_FALLBACK === "true";
 
+if (ALLOW_DEV_AUTH_FALLBACK) {
+    console.warn(
+        "WARNING: Dev auth fallback is ENABLED. Never enable this in production.",
+    );
+}
+
 // Initialize Stripe (if STRIPE_SECRET_KEY is provided)
 const stripe = process.env.STRIPE_SECRET_KEY
     ? new Stripe(process.env.STRIPE_SECRET_KEY)
@@ -20,7 +26,10 @@ const stripe = process.env.STRIPE_SECRET_KEY
 // CORS
 app.use(
     cors({
-        origin: ["http://localhost:3000", CLIENT_URL],
+        origin:
+            process.env.NODE_ENV !== "production"
+                ? ["http://localhost:3000", CLIENT_URL]
+                : [CLIENT_URL],
         credentials: true,
     }),
 );
@@ -72,6 +81,15 @@ async function initMongoDB() {
             ),
             appointmentsCollection.createIndex({ userEmail: 1, createdAt: -1 }),
             transactionsCollection.createIndex({ appointmentId: 1 }),
+            transactionsCollection.createIndex(
+                { stripeSessionId: 1 },
+                {
+                    unique: true,
+                    partialFilterExpression: {
+                        stripeSessionId: { $exists: true },
+                    },
+                },
+            ),
         ]);
 
         return true;
@@ -149,24 +167,37 @@ app.post(
                             ? session.amount_total / 100
                             : Number(appointment.servicePrice);
                         const now = new Date().toISOString();
-                        await transactionsCollection.insertOne({
-                            appointmentId,
-                            appointmentDate: appointment.date || "",
-                            customerId:
-                                appointment.customerId ||
-                                session.metadata?.userEmail ||
-                                "customer",
-                            customerName: appointment.userName || "Customer",
-                            customerEmail: appointment.userEmail || "",
-                            serviceName:
-                                appointment.serviceName || "Salon Treatment",
-                            amount,
-                            currency: session.currency?.toUpperCase() || "USD",
-                            stripeSessionId: session.id,
-                            status: "failed",
-                            createdAt: now,
-                            date: now.split("T")[0],
-                        });
+                        try {
+                            await transactionsCollection.insertOne({
+                                appointmentId,
+                                appointmentDate: appointment.date || "",
+                                customerId:
+                                    appointment.customerId ||
+                                    session.metadata?.userEmail ||
+                                    "customer",
+                                customerName:
+                                    appointment.userName || "Customer",
+                                customerEmail: appointment.userEmail || "",
+                                serviceName:
+                                    appointment.serviceName ||
+                                    "Salon Treatment",
+                                amount,
+                                currency:
+                                    session.currency?.toUpperCase() || "USD",
+                                stripeSessionId: session.id,
+                                status: "failed",
+                                createdAt: now,
+                                date: now.split("T")[0],
+                            });
+                        } catch (err) {
+                            // Ignore duplicate key: Stripe may retry the same event.
+                            if (err.code !== 11000) {
+                                console.error(
+                                    "Failed to record failed transaction:",
+                                    err.message,
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -220,32 +251,43 @@ app.post(
                         }))
                     ) {
                         const amount = session.amount_total / 100;
-                        await transactionsCollection.insertOne({
-                            appointmentId,
-                            appointmentDate: appointment.date || "",
-                            customerId:
-                                appointment.customerId ||
-                                session.metadata?.userEmail ||
-                                "customer",
-                            customerName:
-                                appointment.userName ||
-                                session.metadata?.userName ||
-                                "Customer",
-                            customerEmail:
-                                appointment.userEmail ||
-                                session.metadata?.userEmail ||
-                                "",
-                            serviceName:
-                                appointment.serviceName ||
-                                session.metadata?.serviceName ||
-                                "Salon Treatment",
-                            amount,
-                            currency: session.currency?.toUpperCase() || "USD",
-                            stripeSessionId: session.id,
-                            status: "paid",
-                            createdAt: new Date().toISOString(),
-                            date: new Date().toISOString().split("T")[0],
-                        });
+                        try {
+                            await transactionsCollection.insertOne({
+                                appointmentId,
+                                appointmentDate: appointment.date || "",
+                                customerId:
+                                    appointment.customerId ||
+                                    session.metadata?.userEmail ||
+                                    "customer",
+                                customerName:
+                                    appointment.userName ||
+                                    session.metadata?.userName ||
+                                    "Customer",
+                                customerEmail:
+                                    appointment.userEmail ||
+                                    session.metadata?.userEmail ||
+                                    "",
+                                serviceName:
+                                    appointment.serviceName ||
+                                    session.metadata?.serviceName ||
+                                    "Salon Treatment",
+                                amount,
+                                currency:
+                                    session.currency?.toUpperCase() || "USD",
+                                stripeSessionId: session.id,
+                                status: "paid",
+                                createdAt: new Date().toISOString(),
+                                date: new Date().toISOString().split("T")[0],
+                            });
+                        } catch (err) {
+                            // Ignore duplicate key: Stripe may retry the same event.
+                            if (err.code !== 11000) {
+                                console.error(
+                                    "Failed to record paid transaction:",
+                                    err.message,
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -322,6 +364,10 @@ async function checkBlockedUser(req, res, next) {
             return res.status(403).json({
                 error: "Account Blocked: Access to protected platform features has been restricted.",
             });
+        }
+        // Refresh role from the database so demoted admins lose rights immediately.
+        if (dbUser?.role && dbUser.role !== req.user.role) {
+            req.user.role = dbUser.role;
         }
         return next();
     } catch (err) {
@@ -454,7 +500,7 @@ app.get("/featured-services", async (req, res) => {
     }
 });
 
-// GET /service/:id
+// GET /service/:id (Public; only active services are available)
 app.get("/service/:id", async (req, res) => {
     try {
         const { id } = req.params;
@@ -471,6 +517,9 @@ app.get("/service/:id", async (req, res) => {
         }
         if (!item) {
             return res.status(404).json({ error: "Service not found." });
+        }
+        if (item.isActive !== true) {
+            return res.status(404).json({ error: "Service not available." });
         }
         res.json(item);
     } catch (err) {
@@ -540,10 +589,20 @@ app.post("/services", verifyToken, verifyAdmin, async (req, res) => {
                 ? Boolean(data.isActive)
                 : data.status !== "inactive";
         const newService = {
-            ...data,
             name: svcName,
             serviceName: svcName,
             slug: svcName.toLowerCase().replace(/[^a-z0-9]+/g, "-"),
+            category: data.category,
+            description:
+                typeof data.description === "string" ? data.description : "",
+            shortDescription:
+                typeof data.shortDescription === "string"
+                    ? data.shortDescription
+                    : "",
+            image: typeof data.image === "string" ? data.image : "",
+            gallery: Array.isArray(data.gallery) ? data.gallery : [],
+            location: typeof data.location === "string" ? data.location : "",
+            featured: Boolean(data.featured),
             price,
             duration,
             rating: 5.0,
@@ -552,6 +611,9 @@ app.post("/services", verifyToken, verifyAdmin, async (req, res) => {
             status: isActive ? "active" : "inactive",
             createdAt: new Date().toISOString(),
         };
+        if (data.specialist && typeof data.specialist === "object") {
+            newService.specialist = data.specialist;
+        }
 
         if (servicesCollection) {
             const result = await servicesCollection.insertOne(newService);
@@ -574,7 +636,28 @@ app.post("/services", verifyToken, verifyAdmin, async (req, res) => {
 app.patch("/services/:id", verifyToken, verifyAdmin, async (req, res) => {
     try {
         const { id } = req.params;
-        const updateData = { ...req.body, updatedAt: new Date().toISOString() };
+        const ALLOWED_SERVICE_FIELDS = [
+            "name",
+            "serviceName",
+            "category",
+            "description",
+            "shortDescription",
+            "price",
+            "duration",
+            "image",
+            "gallery",
+            "location",
+            "specialist",
+            "featured",
+            "isActive",
+            "status",
+        ];
+        const updateData = { updatedAt: new Date().toISOString() };
+        for (const field of ALLOWED_SERVICE_FIELDS) {
+            if (Object.hasOwn(req.body, field)) {
+                updateData[field] = req.body[field];
+            }
+        }
         if (Object.hasOwn(updateData, "price")) {
             updateData.price = Number(updateData.price);
             if (!Number.isFinite(updateData.price) || updateData.price <= 0) {
@@ -1280,8 +1363,20 @@ app.patch(
             const { isBlocked } = req.body;
 
             if (usersCollection) {
-                await usersCollection.updateOne(
-                    { email: decodeURIComponent(email).toLowerCase() },
+                const targetEmail = decodeURIComponent(email).toLowerCase();
+                const target = await usersCollection.findOne({
+                    email: targetEmail,
+                });
+                if (!target) {
+                    return res.status(404).json({ error: "User not found." });
+                }
+                if (target.role === "admin") {
+                    return res
+                        .status(400)
+                        .json({ error: "Cannot block an admin account" });
+                }
+                const result = await usersCollection.updateOne(
+                    { email: targetEmail },
                     {
                         $set: {
                             isBlocked: Boolean(isBlocked),
@@ -1289,6 +1384,9 @@ app.patch(
                         },
                     },
                 );
+                if (result.matchedCount === 0) {
+                    return res.status(404).json({ error: "User not found." });
+                }
             }
             res.json({
                 message: `User status updated to ${isBlocked ? "BLOCKED" : "ACTIVE"}`,
@@ -1301,6 +1399,50 @@ app.patch(
         }
     },
 );
+
+// PATCH /user/profile (Protected) - update own name, phone, and image only
+app.patch("/user/profile", verifyToken, async (req, res) => {
+    try {
+        if (!usersCollection) {
+            return res.status(503).json({ error: "Database not connected." });
+        }
+        const { name, phone, image } = req.body;
+        const updates = {};
+        if (typeof name === "string") updates.name = name.trim();
+        if (typeof phone === "string") updates.phone = phone.trim();
+        if (typeof image === "string") updates.image = image;
+        if (Object.keys(updates).length === 0) {
+            return res
+                .status(400)
+                .json({ error: "No valid profile fields to update." });
+        }
+        updates.updatedAt = new Date().toISOString();
+
+        const email = req.user.email.toLowerCase();
+        const result = await usersCollection.updateOne(
+            { email },
+            { $set: updates },
+        );
+        if (result.matchedCount === 0) {
+            return res.status(404).json({ error: "User not found." });
+        }
+        const user = await usersCollection.findOne({ email });
+        return res.json({
+            success: true,
+            user: {
+                name: user?.name || "",
+                phone: user?.phone || "",
+                image: user?.image || "",
+                email: user?.email || "",
+            },
+        });
+    } catch (err) {
+        res.status(500).json({
+            error: "Failed to update profile",
+            details: err.message,
+        });
+    }
+});
 
 // GET /verify-session/:sessionId (Read-only status check)
 app.get("/verify-session/:sessionId", verifyToken, async (req, res) => {
@@ -1326,6 +1468,22 @@ app.get("/verify-session/:sessionId", verifyToken, async (req, res) => {
             details: err.message,
         });
     }
+});
+
+// ─── 404 & Error Handlers ────────────────────────────────────────────────────
+
+// Catch-all for unmatched routes
+app.use((req, res) =>
+    res.status(404).json({ success: false, message: "Route not found" }),
+);
+
+// Global error handler
+app.use((err, req, res, next) => {
+    console.error(err);
+    res.status(err.status || 500).json({
+        success: false,
+        message: err.message || "Internal server error",
+    });
 });
 
 // Start accepting requests only after database indexes are ready.
