@@ -265,3 +265,4 @@ For end-to-end payment testing use Stripe **test keys** and the Stripe CLI (`str
 ## License
 
 This project is created for evaluation purposes. All rights reserved.
+
