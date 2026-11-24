@@ -101,6 +101,17 @@ async function initMongoDB() {
 
 const mongoInitialization = initMongoDB();
 
+const BOOKING_TIME_SLOTS = [
+    "09:00 AM",
+    "10:00 AM",
+    "11:30 AM",
+    "01:00 PM",
+    "02:30 PM",
+    "03:45 PM",
+    "05:00 PM",
+    "06:15 PM",
+];
+
 // ─── Stripe Webhook Route (RAW BODY PARSER) ──────────────────────────────────
 // Must be registered before express.json()
 app.post(
@@ -135,162 +146,219 @@ app.post(
             return res.status(400).send(`Webhook Error: ${err.message}`);
         }
 
-        if (
-            event.type === "checkout.session.expired" ||
-            event.type === "checkout.session.async_payment_failed"
-        ) {
-            const session = event.data.object;
-            const appointmentId = session.metadata?.appointmentId;
-            if (appointmentId && appointmentsCollection) {
-                const filter = ObjectId.isValid(appointmentId)
-                    ? { _id: new ObjectId(appointmentId) }
-                    : { id: appointmentId };
-                const appointment = await appointmentsCollection.findOne({
-                    ...filter,
-                    stripeSessionId: session.id,
-                });
-                if (appointment) {
-                    await appointmentsCollection.updateOne(
-                        { ...filter, stripeSessionId: session.id },
-                        { $unset: { stripeSessionId: "" } },
-                    );
-
-                    if (
-                        event.type ===
-                            "checkout.session.async_payment_failed" &&
-                        transactionsCollection &&
-                        !(await transactionsCollection.findOne({
-                            stripeSessionId: session.id,
-                        }))
-                    ) {
-                        const amount = Number.isFinite(session.amount_total)
-                            ? session.amount_total / 100
-                            : Number(appointment.servicePrice);
-                        const now = new Date().toISOString();
-                        try {
-                            await transactionsCollection.insertOne({
-                                appointmentId,
-                                appointmentDate: appointment.date || "",
-                                customerId:
-                                    appointment.customerId ||
-                                    session.metadata?.userEmail ||
-                                    "customer",
-                                customerName:
-                                    appointment.userName || "Customer",
-                                customerEmail: appointment.userEmail || "",
-                                serviceName:
-                                    appointment.serviceName ||
-                                    "Salon Treatment",
-                                amount,
-                                currency:
-                                    session.currency?.toUpperCase() || "USD",
-                                stripeSessionId: session.id,
-                                status: "failed",
-                                createdAt: now,
-                                date: now.split("T")[0],
-                            });
-                        } catch (err) {
-                            // Ignore duplicate key: Stripe may retry the same event.
-                            if (err.code !== 11000) {
-                                console.error(
-                                    "Failed to record failed transaction:",
-                                    err.message,
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        if (
-            event.type === "checkout.session.completed" ||
-            event.type === "checkout.session.async_payment_succeeded"
-        ) {
-            const session = event.data.object;
-            const appointmentId = session.metadata?.appointmentId;
+        try {
             if (
-                session.payment_status === "paid" &&
-                appointmentId &&
-                appointmentsCollection
+                event.type === "checkout.session.expired" ||
+                event.type === "checkout.session.async_payment_failed"
             ) {
-                const filter = ObjectId.isValid(appointmentId)
-                    ? { _id: new ObjectId(appointmentId) }
-                    : { id: appointmentId };
-                const appointment =
-                    await appointmentsCollection.findOne(filter);
-                const expectedAmount = Math.round(
-                    Number(appointment?.servicePrice) * 100,
-                );
-                const sessionEmail = session.metadata?.userEmail?.toLowerCase();
-
+                const session = event.data.object;
+                const appointmentId = session.metadata?.appointmentId;
                 if (
-                    !appointment ||
-                    !sessionEmail ||
-                    sessionEmail !== appointment.userEmail?.toLowerCase() ||
-                    !Number.isFinite(expectedAmount) ||
-                    session.amount_total !== expectedAmount ||
-                    session.currency !== "usd"
+                    event.type === "checkout.session.async_payment_failed" &&
+                    appointmentId &&
+                    (!appointmentsCollection || !transactionsCollection)
                 ) {
-                    console.error(
-                        `Ignoring paid Checkout Session ${session.id}: appointment, customer, amount, or currency did not match.`,
-                    );
-                } else {
-                    await appointmentsCollection.updateOne(filter, {
-                        $set: {
-                            paymentStatus: "paid",
-                            stripeSessionId: session.id,
-                            paidAt: new Date().toISOString(),
-                        },
+                    return res.status(503).json({
+                        error: "Payment storage is unavailable.",
                     });
+                }
+                if (appointmentId && appointmentsCollection) {
+                    const filter = ObjectId.isValid(appointmentId)
+                        ? { _id: new ObjectId(appointmentId) }
+                        : { id: appointmentId };
+                    const appointment = await appointmentsCollection.findOne({
+                        ...filter,
+                        stripeSessionId: session.id,
+                    });
+                    if (appointment) {
+                        if (
+                            event.type ===
+                                "checkout.session.async_payment_failed" &&
+                            !transactionsCollection
+                        ) {
+                            return res.status(503).json({
+                                error: "Transaction storage is unavailable.",
+                            });
+                        }
+
+                        if (
+                            event.type ===
+                                "checkout.session.async_payment_failed" &&
+                            !(await transactionsCollection.findOne({
+                                stripeSessionId: session.id,
+                            }))
+                        ) {
+                            const amount = Number.isFinite(session.amount_total)
+                                ? session.amount_total / 100
+                                : Number(appointment.servicePrice);
+                            const now = new Date().toISOString();
+                            try {
+                                await transactionsCollection.insertOne({
+                                    appointmentId,
+                                    appointmentDate: appointment.date || "",
+                                    customerId:
+                                        appointment.customerId ||
+                                        session.metadata?.userEmail ||
+                                        "customer",
+                                    customerName:
+                                        appointment.userName || "Customer",
+                                    customerEmail: appointment.userEmail || "",
+                                    serviceName:
+                                        appointment.serviceName ||
+                                        "Salon Treatment",
+                                    amount,
+                                    currency:
+                                        session.currency?.toUpperCase() ||
+                                        "USD",
+                                    stripeSessionId: session.id,
+                                    status: "failed",
+                                    createdAt: now,
+                                    date: now.split("T")[0],
+                                });
+                            } catch (err) {
+                                // Ignore duplicate key: Stripe may retry the same event.
+                                if (err.code !== 11000) {
+                                    console.error(
+                                        "Failed to record failed transaction:",
+                                        err.message,
+                                    );
+                                    throw err;
+                                }
+                            }
+                        }
+
+                        await appointmentsCollection.updateOne(
+                            { ...filter, stripeSessionId: session.id },
+                            { $unset: { stripeSessionId: "" } },
+                        );
+                    }
+                }
+            }
+
+            if (
+                event.type === "checkout.session.completed" ||
+                event.type === "checkout.session.async_payment_succeeded"
+            ) {
+                const session = event.data.object;
+                const appointmentId = session.metadata?.appointmentId;
+                if (
+                    session.payment_status === "paid" &&
+                    appointmentId &&
+                    (!appointmentsCollection || !transactionsCollection)
+                ) {
+                    return res.status(503).json({
+                        error: "Payment storage is unavailable.",
+                    });
+                }
+                if (
+                    session.payment_status === "paid" &&
+                    appointmentId &&
+                    appointmentsCollection
+                ) {
+                    const filter = ObjectId.isValid(appointmentId)
+                        ? { _id: new ObjectId(appointmentId) }
+                        : { id: appointmentId };
+                    const appointment =
+                        await appointmentsCollection.findOne(filter);
+                    const expectedAmount = Math.round(
+                        Number(appointment?.servicePrice) * 100,
+                    );
+                    const sessionEmail =
+                        session.metadata?.userEmail?.toLowerCase();
 
                     if (
-                        transactionsCollection &&
-                        !(await transactionsCollection.findOne({
-                            stripeSessionId: session.id,
-                        }))
+                        !appointment ||
+                        appointment.status !== "confirmed" ||
+                        appointment.stripeSessionId !== session.id ||
+                        !sessionEmail ||
+                        sessionEmail !== appointment.userEmail?.toLowerCase() ||
+                        !Number.isFinite(expectedAmount) ||
+                        session.amount_total !== expectedAmount ||
+                        session.currency !== "usd"
                     ) {
-                        const amount = session.amount_total / 100;
-                        try {
-                            await transactionsCollection.insertOne({
-                                appointmentId,
-                                appointmentDate: appointment.date || "",
-                                customerId:
-                                    appointment.customerId ||
-                                    session.metadata?.userEmail ||
-                                    "customer",
-                                customerName:
-                                    appointment.userName ||
-                                    session.metadata?.userName ||
-                                    "Customer",
-                                customerEmail:
-                                    appointment.userEmail ||
-                                    session.metadata?.userEmail ||
-                                    "",
-                                serviceName:
-                                    appointment.serviceName ||
-                                    session.metadata?.serviceName ||
-                                    "Salon Treatment",
-                                amount,
-                                currency:
-                                    session.currency?.toUpperCase() || "USD",
+                        console.error(
+                            `Ignoring paid Checkout Session ${session.id}: appointment, customer, amount, or currency did not match.`,
+                        );
+                    } else {
+                        const paymentUpdate =
+                            await appointmentsCollection.updateOne(
+                                {
+                                    ...filter,
+                                    status: "confirmed",
+                                    stripeSessionId: session.id,
+                                },
+                                {
+                                    $set: {
+                                        paymentStatus: "paid",
+                                        stripeSessionId: session.id,
+                                        paidAt: new Date().toISOString(),
+                                    },
+                                },
+                            );
+
+                        if (paymentUpdate.matchedCount === 0) {
+                            console.error(
+                                `Ignoring paid Checkout Session ${session.id}: appointment is no longer confirmed for this session.`,
+                            );
+                        }
+                        if (
+                            paymentUpdate.matchedCount > 0 &&
+                            transactionsCollection &&
+                            !(await transactionsCollection.findOne({
                                 stripeSessionId: session.id,
-                                status: "paid",
-                                createdAt: new Date().toISOString(),
-                                date: new Date().toISOString().split("T")[0],
-                            });
-                        } catch (err) {
-                            // Ignore duplicate key: Stripe may retry the same event.
-                            if (err.code !== 11000) {
-                                console.error(
-                                    "Failed to record paid transaction:",
-                                    err.message,
-                                );
+                            }))
+                        ) {
+                            const amount = session.amount_total / 100;
+                            try {
+                                await transactionsCollection.insertOne({
+                                    appointmentId,
+                                    appointmentDate: appointment.date || "",
+                                    customerId:
+                                        appointment.customerId ||
+                                        session.metadata?.userEmail ||
+                                        "customer",
+                                    customerName:
+                                        appointment.userName ||
+                                        session.metadata?.userName ||
+                                        "Customer",
+                                    customerEmail:
+                                        appointment.userEmail ||
+                                        session.metadata?.userEmail ||
+                                        "",
+                                    serviceName:
+                                        appointment.serviceName ||
+                                        session.metadata?.serviceName ||
+                                        "Salon Treatment",
+                                    amount,
+                                    currency:
+                                        session.currency?.toUpperCase() ||
+                                        "USD",
+                                    stripeSessionId: session.id,
+                                    status: "paid",
+                                    createdAt: new Date().toISOString(),
+                                    date: new Date()
+                                        .toISOString()
+                                        .split("T")[0],
+                                });
+                            } catch (err) {
+                                // Ignore duplicate key: Stripe may retry the same event.
+                                if (err.code !== 11000) {
+                                    console.error(
+                                        "Failed to record paid transaction:",
+                                        err.message,
+                                    );
+                                    throw err;
+                                }
                             }
                         }
                     }
                 }
             }
+        } catch (err) {
+            console.error("Stripe webhook processing failed:", err.message);
+            return res.status(500).json({
+                error: "Webhook event could not be processed.",
+            });
         }
 
         res.json({ received: true });
@@ -414,6 +482,8 @@ app.get("/services", async (req, res) => {
             location,
             featured,
         } = req.query;
+        const dateFilter = req.query.date;
+        const timeFilter = req.query.time;
         const page = Math.max(1, Number.parseInt(req.query.page, 10) || 1);
         const limit = Math.min(
             100,
@@ -423,6 +493,46 @@ app.get("/services", async (req, res) => {
         if (!servicesCollection) {
             return res.status(503).json({
                 error: "Database not connected. Please configure MONGODB_URI.",
+            });
+        }
+
+        if (
+            (dateFilter !== undefined && typeof dateFilter !== "string") ||
+            (timeFilter !== undefined && typeof timeFilter !== "string")
+        ) {
+            return res.status(400).json({
+                error: "Invalid appointment date or time filter.",
+            });
+        }
+        if (dateFilter !== undefined) {
+            const parsedDate = new Date(`${dateFilter}T00:00:00.000Z`);
+            if (
+                !/^\d{4}-\d{2}-\d{2}$/.test(dateFilter) ||
+                Number.isNaN(parsedDate.getTime()) ||
+                parsedDate.toISOString().slice(0, 10) !== dateFilter ||
+                dateFilter < new Date().toISOString().slice(0, 10)
+            ) {
+                return res.status(400).json({
+                    error: "Please select a valid future appointment date.",
+                });
+            }
+        }
+        if (
+            timeFilter !== undefined &&
+            timeFilter !== "Any time" &&
+            !BOOKING_TIME_SLOTS.includes(timeFilter)
+        ) {
+            return res.status(400).json({
+                error: "Please select a valid appointment time.",
+            });
+        }
+        if (
+            timeFilter !== undefined &&
+            timeFilter !== "Any time" &&
+            !dateFilter
+        ) {
+            return res.status(400).json({
+                error: "Select an appointment date before filtering by time.",
             });
         }
 
@@ -450,6 +560,51 @@ app.get("/services", async (req, res) => {
             query.price = {};
             if (minPrice) query.price.$gte = Number(minPrice);
             if (maxPrice) query.price.$lte = Number(maxPrice);
+        }
+
+        if (dateFilter) {
+            if (!appointmentsCollection) {
+                return res.status(503).json({
+                    error: "Appointment availability is unavailable.",
+                });
+            }
+            const selectedSlots =
+                timeFilter && timeFilter !== "Any time"
+                    ? [timeFilter]
+                    : BOOKING_TIME_SLOTS;
+            const bookings = await appointmentsCollection
+                .find({
+                    date: dateFilter,
+                    time: { $in: selectedSlots },
+                    status: { $in: ["pending", "confirmed"] },
+                })
+                .project({ serviceId: 1, time: 1 })
+                .toArray();
+            const bookedSlotsByService = new Map();
+            for (const booking of bookings) {
+                if (
+                    typeof booking.serviceId !== "string" ||
+                    typeof booking.time !== "string"
+                ) {
+                    continue;
+                }
+                if (!bookedSlotsByService.has(booking.serviceId)) {
+                    bookedSlotsByService.set(booking.serviceId, new Set());
+                }
+                bookedSlotsByService.get(booking.serviceId).add(booking.time);
+            }
+            const unavailableIds = [...bookedSlotsByService]
+                .filter(([, bookedSlots]) =>
+                    selectedSlots.every((slot) => bookedSlots.has(slot)),
+                )
+                .map(([serviceId]) =>
+                    ObjectId.isValid(serviceId)
+                        ? new ObjectId(serviceId)
+                        : serviceId,
+                );
+            if (unavailableIds.length > 0) {
+                query._id = { $nin: unavailableIds };
+            }
         }
 
         let sortOption = { createdAt: -1 };
@@ -794,10 +949,10 @@ app.post("/booking", verifyToken, async (req, res) => {
             !serviceId.trim() ||
             typeof date !== "string" ||
             typeof time !== "string" ||
-            !time.trim()
+            !BOOKING_TIME_SLOTS.includes(time.trim())
         ) {
             return res.status(400).json({
-                error: "Missing required booking details (serviceId, date, time).",
+                error: "Provide a service, date, and an available appointment time.",
             });
         }
 
@@ -813,7 +968,7 @@ app.post("/booking", verifyToken, async (req, res) => {
         if (!service) {
             return res.status(404).json({ error: "Service not found." });
         }
-        if (service.isActive === false) {
+        if (service.isActive !== true) {
             return res.status(400).json({
                 error: "This service is inactive and cannot be booked.",
             });
@@ -1028,14 +1183,64 @@ app.patch(
                     });
                 }
 
+                if (
+                    status === "cancelled" &&
+                    current.stripeSessionId &&
+                    current.paymentStatus !== "paid"
+                ) {
+                    if (!stripe) {
+                        return res.status(503).json({
+                            error: "Checkout could not be safely cancelled because Stripe is unavailable.",
+                        });
+                    }
+
+                    const checkoutSession =
+                        await stripe.checkout.sessions.retrieve(
+                            current.stripeSessionId,
+                        );
+                    if (checkoutSession.status === "complete") {
+                        return res.status(409).json({
+                            error: "Payment has completed or is processing. Refresh the appointment before cancelling.",
+                        });
+                    }
+                    if (checkoutSession.status === "open") {
+                        await stripe.checkout.sessions.expire(
+                            checkoutSession.id,
+                        );
+                    }
+                }
+
                 const update = {
                     status,
                     updatedAt: new Date().toISOString(),
                 };
                 if (status === "cancelled") update.activeSlot = false;
-                const result = await appointmentsCollection.updateOne(filter, {
-                    $set: update,
-                });
+                const updateFilter =
+                    status === "cancelled"
+                        ? {
+                              ...filter,
+                              status: current.status,
+                              stripeSessionId: current.stripeSessionId ?? {
+                                  $exists: false,
+                              },
+                              paymentStatus: current.paymentStatus ?? {
+                                  $exists: false,
+                              },
+                          }
+                        : filter;
+                const updateOperation = { $set: update };
+                if (status === "cancelled") {
+                    updateOperation.$unset = { stripeSessionId: "" };
+                }
+                const result = await appointmentsCollection.updateOne(
+                    updateFilter,
+                    updateOperation,
+                );
+                if (status === "cancelled" && result.matchedCount === 0) {
+                    return res.status(409).json({
+                        error: "The appointment or checkout changed. Refresh and try cancelling again.",
+                    });
+                }
                 return res.json({
                     message: `Appointment status updated to ${status}`,
                     modifiedCount: result.modifiedCount,
@@ -1269,9 +1474,21 @@ app.post("/create-checkout-session", verifyToken, async (req, res) => {
             });
         }
 
-        await appointmentsCollection.updateOne(filter, {
-            $set: { stripeSessionId: session.id },
-        });
+        const sessionUpdate = await appointmentsCollection.updateOne(
+            {
+                ...filter,
+                status: "confirmed",
+                paymentStatus: { $ne: "paid" },
+                stripeSessionId: apt.stripeSessionId ?? { $exists: false },
+            },
+            { $set: { stripeSessionId: session.id } },
+        );
+        if (sessionUpdate.matchedCount === 0) {
+            await stripe.checkout.sessions.expire(session.id);
+            return res.status(409).json({
+                error: "The appointment changed before checkout could start. Refresh and try again.",
+            });
+        }
 
         res.json({ url: session.url, sessionId: session.id });
     } catch (err) {
