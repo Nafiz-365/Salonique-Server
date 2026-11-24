@@ -1,268 +1,252 @@
-# Salonique — API Server (Backend)
+# Salonique Server
 
-**Salonique** is a full-stack salon appointment booking platform. This repository contains the **Express + MongoDB REST API** that powers the platform: service catalog, appointment scheduling with double-booking prevention, role-enforced administration, and **webhook-verified Stripe payments**.
+Salonique Server is the Express REST API for the Salonique salon-booking platform. It provides the service catalog, appointment booking and administration, user management, and Stripe Checkout integration. Application data is stored in MongoDB.
 
-> **Related repositories**
->
-> - Frontend (Next.js 16): [`Nafiz-365/Salonique-Client`](https://github.com/Nafiz-365/Salonique-Client)
-> - Backend (this repo): [`Nafiz-365/Salonique-Server`](https://github.com/Nafiz-365/Salonique-Server)
+The Next.js client is maintained separately in [Nafiz-365/Salonique-Client](https://github.com/Nafiz-365/Salonique-Client).
 
----
+## Features
 
-## Table of Contents
+- Public service discovery with search, filters, sorting, and pagination.
+- Customer appointment requests with date/time validation and duplicate-slot protection.
+- Role-protected admin endpoints for services, appointments, users, and transactions.
+- Better Auth JWT verification through the client's JWKS endpoint.
+- Stripe Checkout sessions and signature-verified webhooks.
+- MongoDB indexes for catalog lookup, appointment queries, active booking slots, and webhook idempotency.
 
-- [Highlights](#highlights)
-- [Tech Stack](#tech-stack)
-- [Architecture](#architecture)
-- [Getting Started](#getting-started)
-- [Environment Variables](#environment-variables)
-- [Database](#database)
-- [Security Model](#security-model)
-- [Stripe Payment Flow](#stripe-payment-flow)
-- [API Reference](#api-reference)
-- [Project Layout](#project-layout)
-- [Verification](#verification)
-- [Links](#links)
+## Technology
 
----
+| Area | Tools |
+| --- | --- |
+| Runtime | Node.js (ES modules) |
+| HTTP API | Express 4 |
+| Database | MongoDB native driver |
+| Authentication | `jose` JWT verification against Better Auth JWKS |
+| Payments | Stripe Node SDK |
+| Configuration | `dotenv`, `cors` |
 
-## Highlights
-
-- **Webhook-only payment state** — `paymentStatus` and the transaction ledger are written exclusively by signature-verified Stripe webhook events. No client-supplied path can mark an appointment as paid.
-- **Cryptographic auth** — every protected route verifies the Better Auth **JWT via JWKS** (`jose`), then re-checks the database for blocked/suspended status and the _current_ role, so demoted admins lose access immediately.
-- **Double-booking prevention** — an application-level collision check plus a **unique partial index** (`unique_active_appointment_slot`) on `{ serviceId, date, time }` for active appointments.
-- **Idempotent webhooks** — Stripe retries are safe: a unique `stripeSessionId` index and duplicate-key (`11000`) handling make event processing exactly-once.
-- **Strict input handling** — allow-listed service fields, validated status enums, future-date checks, and a global 404 + error handler.
-- **Starts clean** — the server listens only after MongoDB connections and indexes are ready.
-
----
-
-## Tech Stack
-
-| Layer         | Technology                                                                             |
-| ------------- | -------------------------------------------------------------------------------------- |
-| Runtime       | **Node.js 20+** (ES modules)                                                           |
-| Framework     | **Express.js 4**                                                                       |
-| Database      | **MongoDB** native driver (`mongodb` v6+)                                              |
-| Auth          | **`jose`** — JWKS remote key set + `jwtVerify` against the frontend's `/api/auth/jwks` |
-| Payments      | **Stripe SDK** — Checkout Sessions + signed Webhooks                                   |
-| Config / CORS | `dotenv`, `cors` (origin locked to `CLIENT_URL`)                                       |
-
----
+The API is organized in a single `index.js` module, with middleware, webhook processing, and route handlers grouped by responsibility.
 
 ## Architecture
 
-```
-        Next.js frontend (Salonique-Client)
-        ├── public reads  ──────────────►  GET  /services, /featured-services, /service/:id
-        └── BFF proxy (attaches JWT) ───►  all protected routes
-                        │
-                        ▼
-   ┌───────────────────────────────────────────────────────────────┐
-   │  Express API  (this repo — single index.js)                   │
-   │                                                               │
-   │  verifyToken ── JWKS signature ──► checkBlockedUser ──► …     │
-   │  verifyAdmin ── role gate (admin routes)                      │
-   │                                                               │
-   │  POST /webhook (raw body → Stripe signature verification)     │
-   └──────────┬──────────────────────────────┬─────────────────────┘
-              │                              │
-              ▼                              ▼
-         MongoDB                        Stripe
-   services · appointments        Checkout Sessions
-   users · transactions           Webhook events
+```text
+Next.js client
+  ├─ Public catalog requests ─────► Express API
+  └─ Authenticated BFF requests ──► Express API
+                                       │
+                          verify Better Auth JWT via JWKS
+                          check current role and account status
+                                       │
+                               MongoDB database
+
+Stripe Checkout ── signed webhook ──► Express API
+                                       ├─ update appointment payment state
+                                       └─ write transaction record
 ```
 
-**Request lifecycle (protected route)**
+Protected requests carry a Better Auth JWT in `Authorization: Bearer <token>`. The API verifies the token using `${CLIENT_URL}/api/auth/jwks`, requires an email claim, and then checks the corresponding MongoDB user for blocked/suspended status. The role is refreshed from MongoDB on each request so role changes take effect without waiting for the JWT to expire. Admin endpoints also require the `admin` role.
 
-1. `verifyToken` reads `Authorization: Bearer <JWT>` and verifies it against `{CLIENT_URL}/api/auth/jwks`.
-2. `checkBlockedUser` loads the user from MongoDB: blocked/suspended → **403**; the role is refreshed from the database (a demoted admin is rejected even with a still-valid token).
-3. Admin routes additionally pass `verifyAdmin` → **403** for non-admins.
-4. Handlers validate input, apply allow-lists, and return JSON errors from the global handlers.
-
----
+The API checks MongoDB connection and index initialization before calling `listen`. If MongoDB is not configured or initialization fails, the process can still start in standby mode; the root health endpoint reports the database state, and database-dependent endpoints return an unavailable response.
 
 ## Getting Started
 
 ### Prerequisites
 
-- **Node.js 20+**
-- A **MongoDB Atlas** URI or local MongoDB instance
-- _(Optional)_ Stripe test keys for checkout flows
+- Node.js 20 or newer recommended, with npm.
+- MongoDB Atlas or a local MongoDB server.
+- Stripe test credentials for local checkout and webhook testing.
+- The Salonique Client running for Better Auth JWKS verification.
 
-### Installation
+### Install
 
 ```bash
 git clone https://github.com/Nafiz-365/Salonique-Server.git
 cd Salonique-Server
-npm install
+npm ci
 ```
 
-### Configure environment
+Create `.env` from `.env.example` and replace its placeholders with your own configuration. Do not commit `.env` or real credentials.
 
 ```bash
-# create .env from the example and fill in real values
-Copy-Item .env.example .env
+cp .env.example .env
 ```
 
-### Run
+Run the API:
 
 ```bash
-npm run dev    # development (nodemon auto-reload)
-npm start      # production (node index.js)
+npm run dev    # Development with nodemon
+npm start      # Production process
 ```
 
-Verify health: `GET http://localhost:8000` →
-`{ "name": "Salonique API Server", "status": "online", ... }`
+By default, the API listens on port `8000`. Check `GET http://localhost:8000/` for process and dependency status:
 
----
+```json
+{
+  "name": "Salonique API Server",
+  "status": "online",
+  "dbConnected": true,
+  "stripeEnabled": true
+}
+```
+
+The `dbConnected` and `stripeEnabled` fields reflect the current configuration; an online process does not by itself mean that every integration is configured.
 
 ## Environment Variables
 
-Set these names in `.env` or your deployment environment. **Never commit actual secrets.**
+| Variable | Required | Purpose |
+| --- | --- | --- |
+| `PORT` | No | HTTP port; defaults to `8000`. |
+| `MONGODB_URI` | Required for data operations | MongoDB connection string. The API uses the `salonique` database. |
+| `CLIENT_URL` | Yes for normal auth setup | Client origin used for production CORS and the Better Auth JWKS URL. Defaults to `http://localhost:3000`. |
+| `STRIPE_SECRET_KEY` | Optional | Stripe API key; required to create Checkout sessions. Use a test key locally. |
+| `STRIPE_WEBHOOK_SECRET` | Optional | Signing secret for `/webhook`; required to process Stripe events. |
+| `NODE_ENV` | Recommended | Set to `development` locally and `production` in deployment; controls CORS behavior and development auth fallback. |
+| `ALLOW_DEV_AUTH_FALLBACK` | Local development only | Set to `true` only when intentionally testing the `x-user-email` fallback. The fallback is disabled in production. |
 
-| Variable                  | Required            | Purpose                                                                  |
-| ------------------------- | ------------------- | ------------------------------------------------------------------------ |
-| `PORT`                    | no (default `8000`) | HTTP port                                                                |
-| `MONGODB_URI`             | yes                 | MongoDB connection string                                                |
-| `CLIENT_URL`              | yes                 | Frontend origin — CORS allowlist **and** JWKS endpoint base              |
-| `STRIPE_SECRET_KEY`       | for payments        | Stripe API key; checkout routes return 400 until set                     |
-| `STRIPE_WEBHOOK_SECRET`   | for payments        | Webhook signing secret; `/webhook` disabled until set                    |
-| `NODE_ENV`                | yes                 | `production` / `development`                                             |
-| `ALLOW_DEV_AUTH_FALLBACK` | no                  | `true` enables the `x-user-email` dev fallback — **never in production** |
-
-> `.env` must stay in `.gitignore`. The dev fallback logs a warning at startup when enabled.
-
----
-
-## Database
-
-**Collections & purpose**
-
-| Collection     | Contents                                                                                                                                                    |
-| -------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `services`     | Catalog: category, price, duration, image, `isActive`, `featured`, specialist info                                                                          |
-| `appointments` | Bookings: customer, service snapshot, date, time slot, status (`pending/confirmed/completed/cancelled`), `paymentStatus` (`unpaid/paid`), `stripeSessionId` |
-| `users`        | Better Auth accounts: `role` (`customer`/`admin`), `isBlocked`, `status`                                                                                    |
-| `transactions` | Immutable payment ledger — written only by webhook processing                                                                                               |
-
-**Indexes created at startup**
-
-- `services`: `{ category, price }`, `slug`
-- `appointments`: `{ userEmail, createdAt }`, plus the **unique** `unique_active_appointment_slot` on active slots → database-level double-booking guarantee
-- `transactions`: `{ appointmentId }`, plus **unique** `stripeSessionId` → webhook idempotency
-
----
-
-## Security Model
-
-| Control           | Implementation                                                                                                        |
-| ----------------- | --------------------------------------------------------------------------------------------------------------------- |
-| JWT verification  | `verifyToken` — `createRemoteJWKSet` + `jwtVerify` against `{CLIENT_URL}/api/auth/jwks`; requires a valid email claim |
-| Blocked accounts  | `checkBlockedUser` — `isBlocked` or `status: "suspended"` → **403** on every protected route                          |
-| Role freshness    | Role re-read from MongoDB per request — demotions take effect immediately                                             |
-| Admin gate        | `verifyAdmin` on all catalog, appointment-oversight, and user-management routes                                       |
-| CORS              | Production allows only `CLIENT_URL`; credentials enabled                                                              |
-| Mass-assignment   | `ALLOWED_SERVICE_FIELDS` allow-list when creating/updating services                                                   |
-| Input validation  | Status enums, future-date rule, required-field checks, 10 MB JSON limit                                               |
-| Admin protection  | Admin accounts cannot be blocked via `toggle-block`                                                                   |
-| Session ownership | `/verify-session/:sessionId` only reveals sessions belonging to the requester                                         |
-| Error handling    | Catch-all 404 + global error handler → structured JSON, no stack traces leaked                                        |
-
----
-
-## Stripe Payment Flow
-
-1. **Request** — customer books (`POST /booking`) → `pending` / `unpaid`.
-2. **Confirm** — admin confirms (`PATCH /appointment/:id/status`) → customer may pay.
-3. **Checkout** — `POST /create-checkout-session` creates a Stripe Checkout Session (previous session expired first; an existing valid session is reused), embedding `appointmentId` + `userEmail` metadata.
-4. **Redirect** — customer completes payment on Stripe-hosted page.
-5. **Webhook (source of truth)** — `POST /webhook` verifies the Stripe signature on the **raw body**, then:
-    - `checkout.session.completed` / `async_payment_succeeded` → validates **email, amount, and currency** against the stored appointment before setting `paymentStatus: "paid"` and inserting an idempotent `paid` transaction.
-    - `checkout.session.expired` / `async_payment_failed` → releases the reserved `stripeSessionId` and records a `failed` transaction (once).
-    - Mismatched data is logged and **ignored** — never applied.
-
----
+Set `CLIENT_URL` to the exact deployed client origin in production. The API uses it both as the CORS allowlist and as the base URL for Better Auth JWKS verification.
 
 ## API Reference
 
-Base URL (local): `http://localhost:8000`
+Base URL: `http://localhost:8000`
+
+Protected endpoints require `Authorization: Bearer <Better Auth JWT>`. Admin endpoints additionally require a current admin role. Request and response bodies use JSON unless noted.
 
 ### Public
 
-| Method | Endpoint             | Description                                                                                                            |
-| ------ | -------------------- | ---------------------------------------------------------------------------------------------------------------------- |
-| GET    | `/`                  | Health check + database status                                                                                         |
-| GET    | `/services`          | Paginated catalog — `search`, `category`, price range, `sort=price_asc\|price_desc\|rating\|duration`, `page`, `limit` |
-| GET    | `/featured-services` | Active featured treatments                                                                                             |
-| GET    | `/service/:id`       | Single service by ID or slug                                                                                           |
+| Method | Endpoint | Description |
+| --- | --- | --- |
+| `GET` | `/` | Health and integration status. |
+| `GET` | `/services` | Active service catalog with filters and pagination. |
+| `GET` | `/featured-services` | Up to six active featured services. |
+| `GET` | `/service/:id` | Active service by MongoDB ID or slug. |
 
-### Authenticated — Customer (`verifyToken`)
+`GET /services` supports:
 
-| Method | Endpoint                     | Description                                                                     |
-| ------ | ---------------------------- | ------------------------------------------------------------------------------- |
-| POST   | `/booking`                   | Create appointment request — future-date validated, **collision-checked (409)** |
-| GET    | `/my-appointments/:email`    | Caller's appointment history                                                    |
-| PATCH  | `/appointment/:id/cancel`    | Cancel own pending request                                                      |
-| POST   | `/create-checkout-session`   | Create Stripe Checkout session for a confirmed appointment                      |
-| GET    | `/verify-session/:sessionId` | Read-only payment status of **own** session                                     |
-| PATCH  | `/user/profile`              | Update own name / phone / image                                                 |
-| POST   | `/webhook`                   | Stripe webhook (signature-verified; not a user route)                           |
+| Query parameter | Description |
+| --- | --- |
+| `search` | Case-insensitive search across service name, descriptions, location, and specialist name. |
+| `category` | Filter by category; `All` does not restrict the category. |
+| `minPrice`, `maxPrice` | Price range. |
+| `location` | Case-insensitive location filter. |
+| `sort` | `price_asc`, `price_desc`, `rating`, or `duration`. |
+| `featured` | Set to `true` to return featured services only. |
+| `date`, `time` | Filter out services with no free booking slot on the selected date/time. A time filter requires a date. |
+| `page`, `limit` | Pagination; page starts at 1 and limit is capped at 100. |
 
-### Authenticated — Admin (`verifyToken` + `verifyAdmin`)
+The service-list response is `{ "services": [], "total": 0, "page": 1, "totalPages": 1 }`.
 
-| Method | Endpoint                    | Description                                   |
-| ------ | --------------------------- | --------------------------------------------- |
-| GET    | `/admin/services`           | Active **and** inactive services              |
-| POST   | `/services`                 | Create service (allow-listed fields)          |
-| PATCH  | `/services/:id`             | Update service                                |
-| DELETE | `/services/:id`             | Remove service from catalog                   |
-| GET    | `/all-appointments`         | All appointments across the platform          |
-| PATCH  | `/appointment/:id/status`   | Confirm (only from `pending`) or cancel       |
-| GET    | `/users`                    | Customer directory with block status          |
-| PATCH  | `/user/:email/toggle-block` | Block / unblock a customer (admins protected) |
-| GET    | `/transactions`             | Payment history ledger                        |
+### Booking request
 
-**Error shape:** `{ "error": "…" }` (404/500 use `{ "success": false, "message": "…" }`).
+`POST /booking` accepts a JSON body with `serviceId` (MongoDB ID or slug), `date` (`YYYY-MM-DD`), and `time`. The currently accepted time values are `09:00 AM`, `10:00 AM`, `11:30 AM`, `01:00 PM`, `02:30 PM`, `03:45 PM`, `05:00 PM`, and `06:15 PM`. Optional customer details include `userPhone` and `notes` (or `message`). A successful request returns `201`; an occupied slot returns `409`.
 
----
+### Customer
 
-## Project Layout
+| Method | Endpoint | Description |
+| --- | --- | --- |
+| `POST` | `/booking` | Create a pending appointment request for the authenticated customer. Rejects invalid dates/times and occupied slots. |
+| `GET` | `/my-appointments/:email` | List the caller's appointments. The requested email must match the authenticated email. |
+| `PATCH` | `/appointment/:id/cancel` | Customers can cancel their own pending requests. Admins can cancel pending or confirmed appointments through this route. |
+| `POST` | `/create-checkout-session` | Create or reuse a Stripe Checkout session for the caller's confirmed, unpaid appointment. |
+| `GET` | `/verify-session/:sessionId` | Read payment status for the caller's own Checkout session. |
+| `PATCH` | `/user/profile` | Update the authenticated user's name, phone, and/or image. |
 
+### Service management
+
+`POST /services` requires `name` (or `serviceName`), `category`, a positive `price`, and a positive `duration`. `PATCH /services/:id` accepts an allowlist of service fields; `price` and `duration` must remain positive. Service IDs may be MongoDB IDs or slugs.
+
+### Admin
+
+| Method | Endpoint | Description |
+| --- | --- | --- |
+| `GET` | `/admin/services` | List active and inactive services. |
+| `POST` | `/services` | Create a service. |
+| `PATCH` | `/services/:id` | Update allow-listed service fields by ID or slug. |
+| `DELETE` | `/services/:id` | Delete a service; returns a conflict if it has pending or confirmed unpaid bookings. |
+| `GET` | `/all-appointments` | List all appointments. |
+| `PATCH` | `/appointment/:id/status` | Update appointment status to `pending`, `confirmed`, or `cancelled`, subject to transition rules. |
+| `GET` | `/users` | List non-admin users with booking summaries. |
+| `PATCH` | `/user/:email/toggle-block` | Block or unblock a non-admin user. |
+| `GET` | `/transactions` | List payment transaction records. |
+
+### Stripe webhook
+
+| Method | Endpoint | Description |
+| --- | --- | --- |
+| `POST` | `/webhook` | Stripe webhook endpoint. Verifies the `Stripe-Signature` header against the raw request body; it is not a user-authenticated route. |
+
+Route-level errors commonly use `{ "error": "..." }`. Unmatched routes and the final error handler use `{ "success": false, "message": "..." }`; clients should not assume one error shape for every response.
+
+## Database
+
+The API connects to the `salonique` database and uses these collections:
+
+| Collection | Purpose |
+| --- | --- |
+| `services` | Service catalog and active/featured state. |
+| `appointments` | Booking details, status, active-slot reservation, and payment references. |
+| `user` | Better Auth users, roles, and blocked/suspended state. |
+| `transactions` | Stripe payment outcomes associated with appointments. |
+
+Indexes are created during initialization:
+
+- `services`: `{ category, price }` and `{ slug }`.
+- `appointments`: `{ serviceId, date, time, status }`, `{ userEmail, createdAt }`, and a unique partial index on `{ serviceId, date, time }` for documents with `activeSlot: true`.
+- `transactions`: `{ appointmentId }` and a unique partial index on `stripeSessionId` when that field exists.
+
+Booking requests also perform an application-level availability check. The partial unique index provides a database-level guard against concurrent reservations for the same active slot. Cancellation releases the slot by clearing `activeSlot`.
+
+## Authentication and Security
+
+- Better Auth issues the JWT; this API verifies it against the client's JWKS endpoint.
+- Protected requests check the user's current blocked/suspended state and role in MongoDB.
+- Admin routes use a separate role check. Customer booking and payment endpoints require the `customer` role and enforce appointment ownership.
+- Production CORS allows the configured `CLIENT_URL`; development also allows `http://localhost:3000`.
+- Service writes use an explicit field allowlist, and the JSON request body limit is 10 MB.
+- The development auth fallback is disabled whenever `NODE_ENV=production`. Never enable it in a deployed environment.
+
+## Stripe Checkout Flow
+
+1. A customer submits a booking request; it begins as `pending` and `unpaid`.
+2. An administrator confirms the appointment.
+3. The customer requests a Checkout session. The API checks ownership, confirmed status, current service price, and payment state before creating or reusing the session.
+4. Stripe redirects the customer to its hosted payment page.
+5. Stripe sends an event to `/webhook`. The API verifies the signature using the raw request body.
+6. Paid events update an appointment only when the appointment, Checkout session, customer email, amount, and USD currency match. A transaction record is then stored. Expired and failed sessions release the associated session reference; failed payments are recorded.
+
+The webhook's unique `stripeSessionId` index and duplicate-key handling make Stripe retries safe for transaction insertion. A browser redirect or client request does not mark an appointment paid.
+
+For local testing, use Stripe test keys and forward webhook events:
+
+```bash
+stripe listen --forward-to localhost:8000/webhook
 ```
+
+Use the signing secret printed by Stripe CLI as `STRIPE_WEBHOOK_SECRET`.
+
+## Scripts and Verification
+
+```bash
+npm run dev             # Start with nodemon
+npm start                # Start with Node.js
+node --check index.js    # Check JavaScript syntax
+```
+
+There is no automated test script configured in `package.json`. For a local smoke check, start the API and request `GET /`; verify `dbConnected` before testing database-backed routes.
+
+## Project Structure
+
+```text
 salonique-server/
-├── index.js          # Entire API: config, middleware, webhook, routes, handlers
-├── package.json      # scripts: dev (nodemon), start (node)
-├── .env.example      # environment variable names with placeholders
+├── index.js          # Express setup, MongoDB, auth, routes, Stripe webhook
+├── package.json      # Runtime dependencies and scripts
+├── package-lock.json # Locked dependency versions
+├── .env.example      # Environment variable template
 └── README.md
 ```
 
-> The API is intentionally a single, readable module — middleware, webhook processing, and route handlers are sectioned with banner comments.
+## Related Projects
 
----
+- [Salonique Client (Next.js)](https://github.com/Nafiz-365/Salonique-Client)
+- [Salonique Server repository](https://github.com/Nafiz-365/Salonique-Server)
+- API deployment: [https://salonique-server.onrender.com](https://salonique-server.onrender.com)
 
-## Verification
-
-```bash
-node --check index.js     # syntax check
-npm run dev               # boot + confirm "Salonique API Server running"
-curl http://localhost:8000/   # health probe → status: "online"
-```
-
-For end-to-end payment testing use Stripe **test keys** and the Stripe CLI (`stripe listen --forward-to localhost:8000/webhook`).
-
----
-
-## Links
-
-- **Live API**: https://salonique-server.onrender.com/
-- **Server repository**: https://github.com/Nafiz-365/Salonique-Server
-- **Client repository**: https://github.com/Nafiz-365/Salonique-Client
-- **Live frontend**: https://salonique-client.vercel.app/
-
----
-
-## License
-
-This project is created for evaluation purposes. All rights reserved.
-
+The package metadata declares the ISC license.
