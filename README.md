@@ -235,7 +235,8 @@ npm start                # Start with Node.js
 node --check index.js    # Check JavaScript syntax
 ```
 
-There is no automated test script configured in `package.json`. For a local smoke check, start the API and request `GET /`; verify `dbConnected` before testing database-backed routes.
+There is no automated test script configured in `package.json`.
+For a local smoke check, start the API and request `GET /`; verify `dbConnected` before testing database-backed routes.
 
 ## Project Structure
 
