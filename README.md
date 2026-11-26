@@ -1,5 +1,10 @@
 # Salonique Server
 
+[![Node.js](https://img.shields.io/badge/Node.js-20+-339933?logo=nodedotjs&logoColor=white)](https://nodejs.org/)
+[![Express](https://img.shields.io/badge/Express-4-000000?logo=express)](https://expressjs.com/)
+[![MongoDB](https://img.shields.io/badge/MongoDB-Native_Driver-47A248?logo=mongodb&logoColor=white)](https://www.mongodb.com/)
+[![Stripe](https://img.shields.io/badge/Stripe-Checkout-635BFF?logo=stripe&logoColor=white)](https://stripe.com/)
+
 Salonique Server is the Express REST API for the Salonique salon-booking platform. It provides the service catalog, appointment booking and administration, user management, and Stripe Checkout integration. Application data is stored in MongoDB.
 
 The Next.js client is maintained separately in [Nafiz-365/Salonique-Client](https://github.com/Nafiz-365/Salonique-Client).
@@ -15,14 +20,14 @@ The Next.js client is maintained separately in [Nafiz-365/Salonique-Client](http
 
 ## Technology
 
-| Area | Tools |
-| --- | --- |
-| Runtime | Node.js (ES modules) |
-| HTTP API | Express 4 |
-| Database | MongoDB native driver |
+| Area           | Tools                                            |
+| -------------- | ------------------------------------------------ |
+| Runtime        | Node.js (ES modules)                             |
+| HTTP API       | Express 4                                        |
+| Database       | MongoDB native driver                            |
 | Authentication | `jose` JWT verification against Better Auth JWKS |
-| Payments | Stripe Node SDK |
-| Configuration | `dotenv`, `cors` |
+| Payments       | Stripe Node SDK                                  |
+| Configuration  | `dotenv`, `cors`                                 |
 
 The API is organized in a single `index.js` module, with middleware, webhook processing, and route handlers grouped by responsibility.
 
@@ -81,10 +86,10 @@ By default, the API listens on port `8000`. Check `GET http://localhost:8000/` f
 
 ```json
 {
-  "name": "Salonique API Server",
-  "status": "online",
-  "dbConnected": true,
-  "stripeEnabled": true
+    "name": "Salonique API Server",
+    "status": "online",
+    "dbConnected": true,
+    "stripeEnabled": true
 }
 ```
 
@@ -92,15 +97,15 @@ The `dbConnected` and `stripeEnabled` fields reflect the current configuration; 
 
 ## Environment Variables
 
-| Variable | Required | Purpose |
-| --- | --- | --- |
-| `PORT` | No | HTTP port; defaults to `8000`. |
-| `MONGODB_URI` | Required for data operations | MongoDB connection string. The API uses the `salonique` database. |
-| `CLIENT_URL` | Yes for normal auth setup | Client origin used for production CORS and the Better Auth JWKS URL. Defaults to `http://localhost:3000`. |
-| `STRIPE_SECRET_KEY` | Optional | Stripe API key; required to create Checkout sessions. Use a test key locally. |
-| `STRIPE_WEBHOOK_SECRET` | Optional | Signing secret for `/webhook`; required to process Stripe events. |
-| `NODE_ENV` | Recommended | Set to `development` locally and `production` in deployment; controls CORS behavior and development auth fallback. |
-| `ALLOW_DEV_AUTH_FALLBACK` | Local development only | Set to `true` only when intentionally testing the `x-user-email` fallback. The fallback is disabled in production. |
+| Variable                  | Required                     | Purpose                                                                                                            |
+| ------------------------- | ---------------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| `PORT`                    | No                           | HTTP port; defaults to `8000`.                                                                                     |
+| `MONGODB_URI`             | Required for data operations | MongoDB connection string. The API uses the `salonique` database.                                                  |
+| `CLIENT_URL`              | Yes for normal auth setup    | Client origin used for production CORS and the Better Auth JWKS URL. Defaults to `http://localhost:3000`.          |
+| `STRIPE_SECRET_KEY`       | Optional                     | Stripe API key; required to create Checkout sessions. Use a test key locally.                                      |
+| `STRIPE_WEBHOOK_SECRET`   | Optional                     | Signing secret for `/webhook`; required to process Stripe events.                                                  |
+| `NODE_ENV`                | Recommended                  | Set to `development` locally and `production` in deployment; controls CORS behavior and development auth fallback. |
+| `ALLOW_DEV_AUTH_FALLBACK` | Local development only       | Set to `true` only when intentionally testing the `x-user-email` fallback. The fallback is disabled in production. |
 
 Set `CLIENT_URL` to the exact deployed client origin in production. The API uses it both as the CORS allowlist and as the base URL for Better Auth JWKS verification.
 
@@ -112,25 +117,25 @@ Protected endpoints require `Authorization: Bearer <Better Auth JWT>`. Admin end
 
 ### Public
 
-| Method | Endpoint | Description |
-| --- | --- | --- |
-| `GET` | `/` | Health and integration status. |
-| `GET` | `/services` | Active service catalog with filters and pagination. |
-| `GET` | `/featured-services` | Up to six active featured services. |
-| `GET` | `/service/:id` | Active service by MongoDB ID or slug. |
+| Method | Endpoint             | Description                                         |
+| ------ | -------------------- | --------------------------------------------------- |
+| `GET`  | `/`                  | Health and integration status.                      |
+| `GET`  | `/services`          | Active service catalog with filters and pagination. |
+| `GET`  | `/featured-services` | Up to six active featured services.                 |
+| `GET`  | `/service/:id`       | Active service by MongoDB ID or slug.               |
 
 `GET /services` supports:
 
-| Query parameter | Description |
-| --- | --- |
-| `search` | Case-insensitive search across service name, descriptions, location, and specialist name. |
-| `category` | Filter by category; `All` does not restrict the category. |
-| `minPrice`, `maxPrice` | Price range. |
-| `location` | Case-insensitive location filter. |
-| `sort` | `price_asc`, `price_desc`, `rating`, or `duration`. |
-| `featured` | Set to `true` to return featured services only. |
-| `date`, `time` | Filter out services with no free booking slot on the selected date/time. A time filter requires a date. |
-| `page`, `limit` | Pagination; page starts at 1 and limit is capped at 100. |
+| Query parameter        | Description                                                                                             |
+| ---------------------- | ------------------------------------------------------------------------------------------------------- |
+| `search`               | Case-insensitive search across service name, descriptions, location, and specialist name.               |
+| `category`             | Filter by category; `All` does not restrict the category.                                               |
+| `minPrice`, `maxPrice` | Price range.                                                                                            |
+| `location`             | Case-insensitive location filter.                                                                       |
+| `sort`                 | `price_asc`, `price_desc`, `rating`, or `duration`.                                                     |
+| `featured`             | Set to `true` to return featured services only.                                                         |
+| `date`, `time`         | Filter out services with no free booking slot on the selected date/time. A time filter requires a date. |
+| `page`, `limit`        | Pagination; page starts at 1 and limit is capped at 100.                                                |
 
 The service-list response is `{ "services": [], "total": 0, "page": 1, "totalPages": 1 }`.
 
@@ -140,14 +145,14 @@ The service-list response is `{ "services": [], "total": 0, "page": 1, "totalPag
 
 ### Customer
 
-| Method | Endpoint | Description |
-| --- | --- | --- |
-| `POST` | `/booking` | Create a pending appointment request for the authenticated customer. Rejects invalid dates/times and occupied slots. |
-| `GET` | `/my-appointments/:email` | List the caller's appointments. The requested email must match the authenticated email. |
-| `PATCH` | `/appointment/:id/cancel` | Customers can cancel their own pending requests. Admins can cancel pending or confirmed appointments through this route. |
-| `POST` | `/create-checkout-session` | Create or reuse a Stripe Checkout session for the caller's confirmed, unpaid appointment. |
-| `GET` | `/verify-session/:sessionId` | Read payment status for the caller's own Checkout session. |
-| `PATCH` | `/user/profile` | Update the authenticated user's name, phone, and/or image. |
+| Method  | Endpoint                     | Description                                                                                                              |
+| ------- | ---------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| `POST`  | `/booking`                   | Create a pending appointment request for the authenticated customer. Rejects invalid dates/times and occupied slots.     |
+| `GET`   | `/my-appointments/:email`    | List the caller's appointments. The requested email must match the authenticated email.                                  |
+| `PATCH` | `/appointment/:id/cancel`    | Customers can cancel their own pending requests. Admins can cancel pending or confirmed appointments through this route. |
+| `POST`  | `/create-checkout-session`   | Create or reuse a Stripe Checkout session for the caller's confirmed, unpaid appointment.                                |
+| `GET`   | `/verify-session/:sessionId` | Read payment status for the caller's own Checkout session.                                                               |
+| `PATCH` | `/user/profile`              | Update the authenticated user's name, phone, and/or image.                                                               |
 
 ### Service management
 
@@ -155,22 +160,22 @@ The service-list response is `{ "services": [], "total": 0, "page": 1, "totalPag
 
 ### Admin
 
-| Method | Endpoint | Description |
-| --- | --- | --- |
-| `GET` | `/admin/services` | List active and inactive services. |
-| `POST` | `/services` | Create a service. |
-| `PATCH` | `/services/:id` | Update allow-listed service fields by ID or slug. |
-| `DELETE` | `/services/:id` | Delete a service; returns a conflict if it has pending or confirmed unpaid bookings. |
-| `GET` | `/all-appointments` | List all appointments. |
-| `PATCH` | `/appointment/:id/status` | Update appointment status to `pending`, `confirmed`, or `cancelled`, subject to transition rules. |
-| `GET` | `/users` | List non-admin users with booking summaries. |
-| `PATCH` | `/user/:email/toggle-block` | Block or unblock a non-admin user. |
-| `GET` | `/transactions` | List payment transaction records. |
+| Method   | Endpoint                    | Description                                                                                       |
+| -------- | --------------------------- | ------------------------------------------------------------------------------------------------- |
+| `GET`    | `/admin/services`           | List active and inactive services.                                                                |
+| `POST`   | `/services`                 | Create a service.                                                                                 |
+| `PATCH`  | `/services/:id`             | Update allow-listed service fields by ID or slug.                                                 |
+| `DELETE` | `/services/:id`             | Delete a service; returns a conflict if it has pending or confirmed unpaid bookings.              |
+| `GET`    | `/all-appointments`         | List all appointments.                                                                            |
+| `PATCH`  | `/appointment/:id/status`   | Update appointment status to `pending`, `confirmed`, or `cancelled`, subject to transition rules. |
+| `GET`    | `/users`                    | List non-admin users with booking summaries.                                                      |
+| `PATCH`  | `/user/:email/toggle-block` | Block or unblock a non-admin user.                                                                |
+| `GET`    | `/transactions`             | List payment transaction records.                                                                 |
 
 ### Stripe webhook
 
-| Method | Endpoint | Description |
-| --- | --- | --- |
+| Method | Endpoint   | Description                                                                                                                         |
+| ------ | ---------- | ----------------------------------------------------------------------------------------------------------------------------------- |
 | `POST` | `/webhook` | Stripe webhook endpoint. Verifies the `Stripe-Signature` header against the raw request body; it is not a user-authenticated route. |
 
 Route-level errors commonly use `{ "error": "..." }`. Unmatched routes and the final error handler use `{ "success": false, "message": "..." }`; clients should not assume one error shape for every response.
@@ -179,12 +184,12 @@ Route-level errors commonly use `{ "error": "..." }`. Unmatched routes and the f
 
 The API connects to the `salonique` database and uses these collections:
 
-| Collection | Purpose |
-| --- | --- |
-| `services` | Service catalog and active/featured state. |
+| Collection     | Purpose                                                                   |
+| -------------- | ------------------------------------------------------------------------- |
+| `services`     | Service catalog and active/featured state.                                |
 | `appointments` | Booking details, status, active-slot reservation, and payment references. |
-| `user` | Better Auth users, roles, and blocked/suspended state. |
-| `transactions` | Stripe payment outcomes associated with appointments. |
+| `user`         | Better Auth users, roles, and blocked/suspended state.                    |
+| `transactions` | Stripe payment outcomes associated with appointments.                     |
 
 Indexes are created during initialization:
 
